@@ -1,10 +1,15 @@
+#define _POSIX_C_SOURCE 200809L  /* sockets, fork and pipes for the fake servers in upload.c */
+
 #include <check.h>
 
 #include "client.c"
+#include "upload.c"
 
 Suite *vectus_suite(void) {
     Suite *s;
     TCase *tc_client;
+    TCase *tc_upload;
+    TCase *tc_live;
 
     s = suite_create("vectus");
     tc_client = tcase_create("client");
@@ -21,6 +26,37 @@ Suite *vectus_suite(void) {
         tcase_add_test(tc_client, test_vectus_client_init);
     }
     suite_add_tcase(s, tc_client);
+
+    tc_upload = tcase_create("upload");
+    tcase_set_timeout(tc_upload, 30);  /* Check's default is 4 seconds */
+    tcase_add_test(tc_upload, test_upload_headers);
+    tcase_add_test(tc_upload, test_upload_resolve_url);
+    tcase_add_test(tc_upload, test_upload_read_wrapper);
+    tcase_add_test(tc_upload, test_upload_create_and_urls);
+    tcase_add_test(tc_upload, test_upload_too_large_for_server);
+    tcase_add_test(tc_upload, test_upload_unreachable);
+    tcase_add_test(tc_upload, test_upload_stall);
+    tcase_add_test(tc_upload, test_upload_fake_create_and_send);
+    tcase_add_test(tc_upload, test_upload_fake_zero_length);
+    tcase_add_test(tc_upload, test_upload_fake_create_errors);
+    tcase_add_test(tc_upload, test_upload_fake_resume_errors);
+    tcase_add_test(tc_upload, test_upload_fake_send_errors);
+    tcase_add_test(tc_upload, test_upload_fake_resume_needs_seek);
+    tcase_add_test(tc_upload, test_upload_fake_partial_accept);
+    tcase_add_test(tc_upload, test_upload_fake_source_fails);
+    suite_add_tcase(s, tc_upload);
+
+    if (getenv("VECTUS_TEST_URL") != NULL) {
+        tc_live = tcase_create("live");
+        tcase_set_timeout(tc_live, 60);
+        tcase_add_test(tc_live, test_upload_live);
+        tcase_add_test(tc_live, test_upload_live_empty);
+        tcase_add_test(tc_live, test_upload_live_resume);
+        tcase_add_test(tc_live, test_upload_live_length_mismatch);
+        tcase_add_test(tc_live, test_upload_live_gone);
+        tcase_add_test(tc_live, test_upload_live_too_large);
+        suite_add_tcase(s, tc_live);
+    }
 
     return s;
 }

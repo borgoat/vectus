@@ -31,7 +31,15 @@ struct vectus_client_s {
      * the max size supported by the server
      */
     unsigned long long int max_size;
+
+    /**
+     * seconds without a byte moving before a request gives up, so an upload can resume instead of hanging
+     */
+    long stall_timeout;
 };
+
+/* shortcut: every client gets this stall timeout; add a setter when callers need another */
+#define VECTUS_DEFAULT_STALL_TIMEOUT 30L
 
 /**
  * Parse one response header line, as curl hands it to a header callback, and pass its name and trimmed value to handle

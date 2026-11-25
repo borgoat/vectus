@@ -151,7 +151,10 @@ const char *vectus_strerror(vectus_code code) {
     case VECTUS_ERR_MEMORY: return "out of memory";
     case VECTUS_ERR_TRANSPORT: return "could not reach the server";
     case VECTUS_ERR_HTTP_STATUS: return "the server answered with an unexpected HTTP status";
-    case VECTUS_ERR_PROTOCOL: return "the server does not offer tus 1.0.0";
+    case VECTUS_ERR_PROTOCOL: return "the server does not offer tus 1.0.0, or broke the protocol";
+    case VECTUS_ERR_TOO_LARGE: return "the upload is too large";
+    case VECTUS_ERR_GONE: return "the upload no longer exists on the server";
+    case VECTUS_ERR_SOURCE: return "the data to upload could not be read";
     }
     return "unknown error";
 }
@@ -173,9 +176,12 @@ vectus_code vectus_client_init(vectus_client *client, const char *url) {
         goto fail;
     }
     strcpy(v->url, url);
+    v->stall_timeout = VECTUS_DEFAULT_STALL_TIMEOUT;
 
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "OPTIONS");
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);  /* give up on a stalled server instead of hanging */
+    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, v->stall_timeout);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, client_init_header_callback);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) v);
 

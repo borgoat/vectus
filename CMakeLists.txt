@@ -14,7 +14,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(VECTUS_WARNINGS -Wall -Wextra -Wpedantic)
 endif()
 
-add_library(vectus src/client.c src/upload.c src/uploader.c)
+add_library(vectus src/client.c src/upload.c)
 add_library(vectus::vectus ALIAS vectus)
 target_include_directories(vectus PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -61,4 +61,5 @@ if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING)
     target_compile_options(vectus-test PRIVATE ${VECTUS_WARNINGS} ${VECTUS_SANITIZE})
     target_link_options(vectus-test PRIVATE ${VECTUS_SANITIZE})
     add_test(NAME vectus-test COMMAND vectus-test)
+    set_tests_properties(vectus-test PROPERTIES TIMEOUT 600)  # a hang fails instead of stalling CI
 endif()

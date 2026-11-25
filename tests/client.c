@@ -106,7 +106,7 @@ START_TEST(test_strerror)
 {
     vectus_code code;
 
-    for (code = VECTUS_OK; code <= VECTUS_ERR_PROTOCOL; code++) {
+    for (code = VECTUS_OK; code <= VECTUS_ERR_SOURCE; code++) {
         ck_assert_str_ne(vectus_strerror(code), "unknown error");
     }
     ck_assert_str_eq(vectus_strerror((vectus_code) 99), "unknown error");
