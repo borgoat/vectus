@@ -130,28 +130,50 @@ static size_t client_init_header_callback(char *buffer, size_t size, size_t nite
 
 vectus_client vectus_client_init(const char *url) {
     vectus_client v = calloc(1, sizeof(struct vectus_client_s));  /* zeroed, so cleanup is safe when the server sends no Tus-Version */
+    CURL *c = NULL;
+    CURLcode res;
+    long status = 0;
+
+    if (v == NULL) {
+        return NULL;
+    }
 
     v->url = calloc(strlen(url) + 1, sizeof(char));
+    c = curl_easy_init();
+    if (v->url == NULL || c == NULL) {
+        goto fail;
+    }
     strcpy(v->url, url);
-
-    CURL *c = curl_easy_init();
 
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "OPTIONS");
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, client_init_header_callback);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) v);
 
-    CURLcode res = curl_easy_perform(c);
+    res = curl_easy_perform(c);
     if (res != CURLE_OK) {
-        fprintf(stderr, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
-        /* TODO: handle error */
+        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+        goto fail;
+    }
+
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    if (status < 200 || status > 299) {  /* tus servers answer OPTIONS with 200 or 204 */
+        goto fail;
     }
 
     curl_easy_cleanup(c);
     return v;
+
+fail:
+    curl_easy_cleanup(c);  /* no-op on NULL */
+    vectus_client_cleanup(v);
+    return NULL;
 }
 
 void vectus_client_cleanup(vectus_client client) {
+    if (client == NULL) {
+        return;
+    }
     free(client->url);
     free(client->version);
     free(client);

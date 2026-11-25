@@ -12,6 +12,7 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_client, test_parse_extensions);
     tcase_add_test(tc_client, test_header_callback);
     tcase_add_test(tc_client, test_cleanup_without_headers);
+    tcase_add_test(tc_client, test_vectus_client_init_unreachable);
     if (getenv("VECTUS_TEST_URL") != NULL) {
         tcase_add_test(tc_client, test_vectus_client_init);
     }

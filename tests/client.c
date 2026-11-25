@@ -49,6 +49,13 @@ START_TEST(test_cleanup_without_headers)
 }
 END_TEST
 
+START_TEST(test_vectus_client_init_unreachable)
+{
+    vectus_client_cleanup(NULL);
+    ck_assert_ptr_null(vectus_client_init("http://127.0.0.1:1/"));  /* nothing listens on port 1 */
+}
+END_TEST
+
 /* Needs a tus server, e.g. VECTUS_TEST_URL=http://localhost:8080/files/ */
 START_TEST(test_vectus_client_init)
 {
@@ -56,6 +63,7 @@ START_TEST(test_vectus_client_init)
     vectus_client c;
     c = vectus_client_init(url);
 
+    ck_assert_ptr_nonnull(c);
     ck_assert_str_eq(c->url, url);
     ck_assert(c->extensions & VECTUS_EXT_CREATION);
 
