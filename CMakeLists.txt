@@ -19,7 +19,7 @@ add_library(vectus::vectus ALIAS vectus)
 target_include_directories(vectus PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vectus PUBLIC CURL::libcurl)
+target_link_libraries(vectus PRIVATE CURL::libcurl)  # the public headers don't include curl
 target_compile_options(vectus PRIVATE ${VECTUS_WARNINGS})
 
 install(TARGETS vectus EXPORT vectusTargets)
