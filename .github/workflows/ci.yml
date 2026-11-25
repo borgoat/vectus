@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [development]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.cc }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, cc: gcc }
+          - { os: ubuntu-24.04, cc: clang }
+          - { os: macos-15, cc: clang }
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev check pkg-config
+          else
+            brew install check pkg-config
+          fi
+      - run: cmake -B build -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Fail if the tests would run without sanitizers
+        run: grep -q '^VECTUS_HAVE_SANITIZERS:INTERNAL=1$' build/CMakeCache.txt
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  e2e:
+    runs-on: ubuntu-24.04
+    services:
+      tusd:
+        image: tusproject/tusd:v2.10.3
+        ports:
+          - 8080:8080
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev check pkg-config
+      - run: cmake -B build && cmake --build build
+      - name: Wait for tusd
+        run: timeout 60 sh -c 'until curl -fsS -X OPTIONS -o /dev/null http://localhost:8080/files/; do sleep 1; done'
+      - run: ctest --test-dir build --output-on-failure
+        env:
+          VECTUS_TEST_URL: http://localhost:8080/files/
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y clang libcurl4-openssl-dev pkg-config
+      - run: |
+          # shellcheck disable=SC2046 # pkg-config output must split into separate flags
+          clang -g -Wall -Wextra -Wpedantic -Werror -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -Iinclude fuzz/header.c $(pkg-config --cflags --libs libcurl) -o fuzz-header
+      # shortcut: a fixed 60s run with no saved corpus; move to ClusterFuzzLite when findings need tracking across runs
+      - run: ./fuzz-header -dict=fuzz/header.dict -max_total_time=60
