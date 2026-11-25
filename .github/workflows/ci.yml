@@ -49,9 +49,15 @@ jobs:
       - run: cmake -B build && cmake --build build
       - name: Wait for tusd
         run: timeout 60 sh -c 'until curl -fsS -X OPTIONS -o /dev/null http://localhost:8080/files/; do sleep 1; done'
-      - run: ctest --test-dir build --output-on-failure
+      - name: Run the tests, including the live one
+        shell: bash
+        run: |
+          ctest --test-dir build --output-on-failure --verbose | tee ctest.log
+          # ctest passes the same when the live test is skipped, so check it really ran
+          grep -q ':test_vectus_client_init:0: Passed' ctest.log
         env:
           VECTUS_TEST_URL: http://localhost:8080/files/
+          CK_VERBOSITY: verbose
 
   fuzz:
     runs-on: ubuntu-24.04
