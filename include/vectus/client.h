@@ -14,6 +14,7 @@
 #define VECTUS_EXT_CHECKSUM             (1 << 3)
 #define VECTUS_EXT_TERMINATION          (1 << 4)
 #define VECTUS_EXT_CONCATENATION        (1 << 5)
+#define VECTUS_EXT_CREATION_DEFER_LENGTH (1 << 6)
 
 #ifdef __cplusplus
 extern "C" {

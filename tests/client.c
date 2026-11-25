@@ -17,7 +17,8 @@ START_TEST(test_parse_extensions)
 {
     char extensions[] = "creation, termination ,checksum,creation-defer-length";
 
-    ck_assert_uint_eq(parse_extensions(extensions), VECTUS_EXT_CREATION | VECTUS_EXT_TERMINATION | VECTUS_EXT_CHECKSUM);
+    ck_assert_uint_eq(parse_extensions(extensions),
+                      VECTUS_EXT_CREATION | VECTUS_EXT_TERMINATION | VECTUS_EXT_CHECKSUM | VECTUS_EXT_CREATION_DEFER_LENGTH);
 }
 END_TEST
 
@@ -34,6 +35,16 @@ START_TEST(test_header_callback)
 
     feed_header(c, "Tus-Version: 1.0.0");  /* no trailing newline, and replaces the earlier value */
     ck_assert_str_eq(c->version, "1.0.0");
+
+    feed_header(c, "Tus-Max-Size: 18446744073709551615\r\n");
+    ck_assert(c->max_size == 18446744073709551615ULL);
+    c->max_size = 0;
+    feed_header(c, "Tus-Max-Size: -1\r\n");
+    feed_header(c, "Tus-Max-Size: 12abc\r\n");
+    feed_header(c, "Tus-Max-Size:\r\n");
+    ck_assert(c->max_size == 0);
+    feed_header(c, "Tus-Max-Size: 18446744073709551616\r\n");  /* one past the maximum */
+    ck_assert(c->max_size == 0);
 
     vectus_client_cleanup(c);
 }
