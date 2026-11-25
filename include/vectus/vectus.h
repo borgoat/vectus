@@ -12,10 +12,22 @@ extern "C" {
 #endif
 
 /**
- * Called for the next bytes to upload: write at most size * nitems bytes into buffer and return how many were written, 0 at the end.
- * It has the signature of libcurl's CURLOPT_READFUNCTION, without making vectus users include curl.
+ * Return this from a vectus_read_callback to abort the upload, for example when reading the data failed
+ */
+#define VECTUS_READ_ABORT ((size_t) -1)
+
+/**
+ * Called for the next bytes to upload: write at most size * nitems bytes into buffer and return how many were written.
+ * The stream starts at the upload's first byte and must deliver exactly its length; return VECTUS_READ_ABORT to give up.
  */
 typedef size_t (*vectus_read_callback)(char *buffer, size_t size, size_t nitems, void *userdata);
+
+/**
+ * Called to move the stream to offset bytes from its start, so an interrupted upload resumes where the server stopped
+ *
+ * @return 0 on success, anything else if the stream cannot move there
+ */
+typedef int (*vectus_seek_callback)(void *userdata, unsigned long long offset);
 
 /**
  * vectus_upload represents a file to be uploaded via tus
@@ -23,21 +35,54 @@ typedef size_t (*vectus_read_callback)(char *buffer, size_t size, size_t nitems,
 typedef struct vectus_upload_s *vectus_upload;
 
 /**
- * Create a vectus_upload reading its bytes from read_callback.
+ * Create a vectus_upload of length bytes, read from read_callback.
  * Once done, release it with vectus_upload_cleanup
  *
- * @return a vectus_upload, or NULL if out of memory
+ * @param upload set to the new vectus_upload on success, to NULL otherwise
+ * @param read_callback delivers the bytes to upload
+ * @param seek_callback moves the stream when resuming mid-way, or NULL if it cannot; resuming mid-way then fails with VECTUS_ERR_SOURCE
+ * @param userdata passed to both callbacks
+ * @param length the number of bytes to upload
+ * @return VECTUS_OK, VECTUS_ERR_MEMORY, or VECTUS_ERR_TOO_LARGE if length does not fit curl's signed 64-bit size
  */
-vectus_upload vectus_upload_create(vectus_read_callback read_callback);
+vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback read_callback, vectus_seek_callback seek_callback,
+                                 void *userdata, unsigned long long length);
+
+/**
+ * Send the bytes the server does not have yet: create the upload on the server if it has no URL,
+ * otherwise ask the server how many bytes it has, then send the rest.
+ * After VECTUS_ERR_TRANSPORT or VECTUS_ERR_HTTP_STATUS, for example when the connection dropped,
+ * call it again to resume where the server stopped.
+ *
+ * @return VECTUS_OK once the server has every byte, or why it stopped
+ */
+vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload);
+
+/**
+ * The upload's URL on the server, NULL until vectus_upload_perform created it.
+ * Store it to resume the upload later, possibly from another process, with vectus_upload_set_url
+ */
+const char *vectus_upload_url(vectus_upload upload);
+
+/**
+ * Point the upload at one created earlier, so vectus_upload_perform resumes it instead of creating a new one
+ *
+ * @param url a URL vectus_upload_url returned, or NULL to forget it so the next perform creates a new upload
+ * @return VECTUS_OK, or VECTUS_ERR_MEMORY
+ */
+vectus_code vectus_upload_set_url(vectus_upload upload, const char *url);
+
+/**
+ * How many bytes the server confirmed it has, as of the last vectus_upload_perform
+ */
+unsigned long long vectus_upload_offset(vectus_upload upload);
 
 /**
  * Free up a vectus_upload instance
  *
- * @param upload the vectus_upload to cleanup
+ * @param upload the vectus_upload to cleanup, or NULL to do nothing
  */
 void vectus_upload_cleanup(vectus_upload upload);
-
-typedef struct vectus_uploader_s *vectus_uploader;
 
 #ifdef __cplusplus
 }

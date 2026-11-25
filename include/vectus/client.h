@@ -28,7 +28,10 @@ typedef enum {
     VECTUS_ERR_MEMORY,       /* out of memory */
     VECTUS_ERR_TRANSPORT,    /* the server could not be reached: DNS, connection, TLS or timeout */
     VECTUS_ERR_HTTP_STATUS,  /* the server answered with an unexpected HTTP status */
-    VECTUS_ERR_PROTOCOL      /* the server does not offer tus 1.0.0 */
+    VECTUS_ERR_PROTOCOL,     /* the server does not offer tus 1.0.0, or broke the protocol */
+    VECTUS_ERR_TOO_LARGE,    /* the upload is larger than the server or curl accept */
+    VECTUS_ERR_GONE,         /* the upload no longer exists on the server; forget its URL to start over */
+    VECTUS_ERR_SOURCE        /* the read callback aborted or ended early, or resuming needed a seek that failed or is not possible */
 } vectus_code;
 
 /**
