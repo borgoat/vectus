@@ -13,6 +13,24 @@ static void feed_header(vectus_client c, const char *line) {
     free(buffer);
 }
 
+START_TEST(test_parse_size)
+{
+    unsigned long long size = 7;
+
+    ck_assert_int_eq(vectus_parse_size("18446744073709551615", &size), 1);
+    ck_assert(size == 18446744073709551615ULL);
+    size = 7;
+    ck_assert_int_eq(vectus_parse_size("18446744073709551616", &size), 0);  /* one past the maximum */
+    ck_assert_int_eq(vectus_parse_size("-1", &size), 0);
+    ck_assert_int_eq(vectus_parse_size("+1", &size), 0);
+    ck_assert_int_eq(vectus_parse_size("12abc", &size), 0);
+    ck_assert_int_eq(vectus_parse_size("", &size), 0);
+    ck_assert(size == 7);  /* failures leave it alone */
+    ck_assert_int_eq(vectus_parse_size("0", &size), 1);
+    ck_assert(size == 0);
+}
+END_TEST
+
 START_TEST(test_parse_extensions)
 {
     char extensions[] = "creation, termination ,checksum,creation-defer-length";
