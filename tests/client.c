@@ -60,10 +60,34 @@ START_TEST(test_cleanup_without_headers)
 }
 END_TEST
 
+START_TEST(test_offers_tus_1_0_0)
+{
+    ck_assert(offers_tus_1_0_0("1.0.0"));
+    ck_assert(offers_tus_1_0_0("0.2.2, 1.0.0"));
+    ck_assert(!offers_tus_1_0_0("1.0.01,0.2.2"));
+    ck_assert(!offers_tus_1_0_0("11.0.0"));
+    ck_assert(!offers_tus_1_0_0(""));
+}
+END_TEST
+
+START_TEST(test_strerror)
+{
+    vectus_code code;
+
+    for (code = VECTUS_OK; code <= VECTUS_ERR_PROTOCOL; code++) {
+        ck_assert_str_ne(vectus_strerror(code), "unknown error");
+    }
+    ck_assert_str_eq(vectus_strerror((vectus_code) 99), "unknown error");
+}
+END_TEST
+
 START_TEST(test_vectus_client_init_unreachable)
 {
+    vectus_client c = (vectus_client) &c;  /* any non-NULL value, to check init resets it */
+
     vectus_client_cleanup(NULL);
-    ck_assert_ptr_null(vectus_client_init("http://127.0.0.1:1/"));  /* nothing listens on port 1 */
+    ck_assert_int_eq(vectus_client_init(&c, "http://127.0.0.1:1/"), VECTUS_ERR_TRANSPORT);  /* nothing listens on port 1 */
+    ck_assert_ptr_null(c);
 }
 END_TEST
 
@@ -72,9 +96,8 @@ START_TEST(test_vectus_client_init)
 {
     const char *url = getenv("VECTUS_TEST_URL");
     vectus_client c;
-    c = vectus_client_init(url);
 
-    ck_assert_ptr_nonnull(c);
+    ck_assert_int_eq(vectus_client_init(&c, url), VECTUS_OK);
     ck_assert_str_eq(c->url, url);
     ck_assert(c->extensions & VECTUS_EXT_CREATION);
 

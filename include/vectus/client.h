@@ -21,17 +21,37 @@ extern "C" {
 #endif
 
 /**
+ * The result of a vectus call, described by vectus_strerror
+ */
+typedef enum {
+    VECTUS_OK = 0,
+    VECTUS_ERR_MEMORY,       /* out of memory */
+    VECTUS_ERR_TRANSPORT,    /* the server could not be reached: DNS, connection, TLS or timeout */
+    VECTUS_ERR_HTTP_STATUS,  /* the server answered with an unexpected HTTP status */
+    VECTUS_ERR_PROTOCOL      /* the server does not offer tus 1.0.0 */
+} vectus_code;
+
+/**
+ * Describe a vectus_code
+ *
+ * @return a static, human-readable message
+ */
+const char *vectus_strerror(vectus_code code);
+
+/**
  * vectus_client represents a tus client connected to 1 tus server
  */
 typedef struct vectus_client_s *vectus_client;
 
 /**
- * Create a vectus_client pointing to the given tus server url.
+ * Create a vectus_client for the tus server at url, asking it which versions and extensions it offers.
  * Once done, release the client with vectus_client_cleanup
  *
- * @return a vectus_client, or NULL if out of memory, the server is unreachable or it does not answer OPTIONS with a 2xx
+ * @param client set to the new vectus_client on success, to NULL otherwise
+ * @param url the tus server's upload endpoint
+ * @return VECTUS_OK, or why the client could not be created
  */
-vectus_client vectus_client_init(const char *url);
+vectus_code vectus_client_init(vectus_client *client, const char *url);
 
 /**
  * Free up a vectus_client instance
