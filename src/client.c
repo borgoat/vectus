@@ -37,7 +37,7 @@ struct vectus_client_s {
  * @param extensions
  * @return
  */
-unsigned int parse_extensions(char *extensions) {
+static unsigned int parse_extensions(char *extensions) {
     unsigned int ext_flag = 0;
     char *current = extensions;
     char *next = NULL;
@@ -45,6 +45,10 @@ unsigned int parse_extensions(char *extensions) {
     for (;;) {
         next = strchr(current, ',');
         if (next != NULL) *next = '\0';
+
+        /* HTTP lists allow whitespace around the commas */
+        current += strspn(current, " \t");
+        current[strcspn(current, " \t")] = '\0';
 
         if (strcmp(current, "creation") == 0) {
             ext_flag |= VECTUS_EXT_CREATION;
@@ -68,55 +72,66 @@ unsigned int parse_extensions(char *extensions) {
 }
 
 /**
- * Used to fetch the tus extensions the server implements while initialising our vectus_client
+ * Store one null-terminated "Name: value" header line into the client
  *
- * @param buffer
- * @param size
- * @param nitems
- * @param userdata
- * @return
+ * @param v the client being initialised
+ * @param line the header line, modified in place
  */
-size_t client_init_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
-    vectus_client v = userdata;
+static void client_parse_header(vectus_client v, char *line) {
+    char *value = strchr(line, ':');
+    char *end;
 
-    size_t bytes = size * nitems;
-    char *buffer_end = buffer + bytes - 1;
-
-    char *sep = memchr(buffer, ':', bytes);
-    if (sep == NULL) {  /* Check if the header is not of the Key: Value form (first line usually: GET / [...]) */
-        return bytes;
+    if (value == NULL) {  /* Not of the Key: Value form (the status line, or the blank line ending the headers) */
+        return;
     }
+    *value++ = '\0';  /* line is now the null-terminated header name */
 
-    *sep = '\0';  /* The separator - colon (:) - is set to NULL so that we have a null-terminated string starting at buffer */
-    /* Trim newlines from the end of our header */
-    while (*buffer_end == '\n' || *buffer_end == '\r') buffer_end--;
-    buffer_end++;
+    /* Trim whitespace and the CRLF around the value */
+    value += strspn(value, " \t");
+    end = value + strlen(value);
+    while (end > value && strchr(" \t\r\n", end[-1]) != NULL) end--;
+    *end = '\0';
 
-    *buffer_end = '\0';
-    char *name = buffer; /* At buffer - null-terminated now at sep - starts our key */
-    char *value = sep + 1; /* After sep starts our value */
-
-    /* Since the value may have an undefined number of whitespaces on the left, we trim them */
-    while (*value == ' ') {
-        value++;
-    }
-
-    if (strcmp(name, "Tus-Version") == 0) {
-        v->version = calloc(strlen(value), sizeof(char));
-        strcpy(v->version, value);
-    } else if (strcmp(name, "Tus-Resumable") == 0) {
+    /* Header names are case-insensitive, and HTTP/2 sends them lowercase */
+    if (curl_strequal(line, "Tus-Version")) {
+        free(v->version);
+        v->version = malloc(strlen(value) + 1);
+        if (v->version != NULL) strcpy(v->version, value);
+    } else if (curl_strequal(line, "Tus-Resumable")) {
         /* TODO */
-    } else if (strcmp(name, "Tus-Extension") == 0) {
+    } else if (curl_strequal(line, "Tus-Extension")) {
         v->extensions = parse_extensions(value);
     }
+}
 
+/**
+ * Used to fetch the tus extensions the server implements while initialising our vectus_client
+ *
+ * @param buffer one header line, not null-terminated
+ * @param size
+ * @param nitems
+ * @param userdata the vectus_client being initialised
+ * @return the bytes handled; anything else makes curl abort the transfer
+ */
+static size_t client_init_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
+    size_t bytes = size * nitems;
+    char *line = malloc(bytes + 1);  /* curl's buffer is not null-terminated, so parse a terminated copy */
+
+    if (line == NULL) {
+        return 0;
+    }
+    memcpy(line, buffer, bytes);
+    line[bytes] = '\0';
+
+    client_parse_header(userdata, line);
+    free(line);
     return bytes;
 }
 
 vectus_client vectus_client_init(const char *url) {
-    vectus_client v = malloc(sizeof(struct vectus_client_s));
+    vectus_client v = calloc(1, sizeof(struct vectus_client_s));  /* zeroed, so cleanup is safe when the server sends no Tus-Version */
 
-    v->url = calloc(strlen(url), sizeof(char));
+    v->url = calloc(strlen(url) + 1, sizeof(char));
     strcpy(v->url, url);
 
     CURL *c = curl_easy_init();
