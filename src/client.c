@@ -7,29 +7,8 @@
 #include <curl/curl.h>
 #include <vectus/client.h>
 
+#include "internal.h"
 
-struct vectus_client_s {
-
-    /**
-     * the endpoint of the tus server client will be uploading to
-     */
-    char *url;
-
-    /**
-     * the extensions supported by the server
-     */
-    unsigned int extensions;
-
-    /**
-     * the tus version of the server
-     */
-    char *version;
-
-    /**
-     * the max size supported by the server
-     */
-    unsigned long long int max_size;
-};
 
 /**
  * Convert Tus-Extensions into the extensions flags
@@ -74,43 +53,67 @@ static unsigned int parse_extensions(char *extensions) {
     return ext_flag;
 }
 
-/**
- * Store one null-terminated "Name: value" header line into the client
- *
- * @param v the client being initialised
- * @param line the header line, modified in place
- */
-static void client_parse_header(vectus_client v, char *line) {
-    char *value = strchr(line, ':');
+size_t vectus_parse_header_line(const char *buffer, size_t bytes, void (*handle)(void *target, const char *name, char *value), void *target) {
+    char *line = malloc(bytes + 1);  /* curl's buffer is not null-terminated, so parse a terminated copy */
+    char *value;
     char *end;
 
-    if (value == NULL) {  /* Not of the Key: Value form (the status line, or the blank line ending the headers) */
-        return;
+    if (line == NULL) {
+        return 0;
     }
-    *value++ = '\0';  /* line is now the null-terminated header name */
+    memcpy(line, buffer, bytes);
+    line[bytes] = '\0';
 
-    /* Trim whitespace and the CRLF around the value */
-    value += strspn(value, " \t");
-    end = value + strlen(value);
-    while (end > value && strchr(" \t\r\n", end[-1]) != NULL) end--;
-    *end = '\0';
+    value = strchr(line, ':');
+    if (value != NULL) {
+        *value++ = '\0';  /* line is now the null-terminated header name */
+
+        /* Trim whitespace and the CRLF around the value */
+        value += strspn(value, " \t");
+        end = value + strlen(value);
+        while (end > value && strchr(" \t\r\n", end[-1]) != NULL) end--;
+        *end = '\0';
+
+        handle(target, line, value);
+    }
+
+    free(line);
+    return bytes;
+}
+
+int vectus_parse_size(const char *value, unsigned long long *size) {
+    unsigned long long parsed;
+
+    /* Digits only: strtoull would also accept a sign and wrap "-1" around to the maximum */
+    if (*value == '\0' || value[strspn(value, "0123456789")] != '\0') {
+        return 0;
+    }
+    errno = 0;
+    parsed = strtoull(value, NULL, 10);
+    if (errno == ERANGE) {
+        return 0;
+    }
+    *size = parsed;
+    return 1;
+}
+
+/**
+ * Store one response header into the client being initialised
+ */
+static void client_handle_header(void *target, const char *name, char *value) {
+    vectus_client v = target;
 
     /* Header names are case-insensitive, and HTTP/2 sends them lowercase */
-    if (curl_strequal(line, "Tus-Version")) {
+    if (curl_strequal(name, "Tus-Version")) {
         free(v->version);
         v->version = malloc(strlen(value) + 1);
         if (v->version != NULL) strcpy(v->version, value);
-    } else if (curl_strequal(line, "Tus-Resumable")) {
+    } else if (curl_strequal(name, "Tus-Resumable")) {
         /* TODO */
-    } else if (curl_strequal(line, "Tus-Extension")) {
+    } else if (curl_strequal(name, "Tus-Extension")) {
         v->extensions = parse_extensions(value);
-    } else if (curl_strequal(line, "Tus-Max-Size")) {
-        /* Digits only: strtoull would also accept a sign and wrap "-1" around to the maximum */
-        if (*value != '\0' && value[strspn(value, "0123456789")] == '\0') {
-            errno = 0;
-            v->max_size = strtoull(value, NULL, 10);
-            if (errno == ERANGE) v->max_size = 0;  /* 0 means no known limit */
-        }
+    } else if (curl_strequal(name, "Tus-Max-Size")) {
+        vectus_parse_size(value, &v->max_size);  /* an invalid value leaves it at 0, meaning no known limit */
     }
 }
 
@@ -124,18 +127,7 @@ static void client_parse_header(vectus_client v, char *line) {
  * @return the bytes handled; anything else makes curl abort the transfer
  */
 static size_t client_init_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
-    size_t bytes = size * nitems;
-    char *line = malloc(bytes + 1);  /* curl's buffer is not null-terminated, so parse a terminated copy */
-
-    if (line == NULL) {
-        return 0;
-    }
-    memcpy(line, buffer, bytes);
-    line[bytes] = '\0';
-
-    client_parse_header(userdata, line);
-    free(line);
-    return bytes;
+    return vectus_parse_header_line(buffer, size * nitems, client_handle_header, userdata);
 }
 
 /**

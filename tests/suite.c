@@ -9,6 +9,7 @@ Suite *vectus_suite(void) {
     s = suite_create("vectus");
     tc_client = tcase_create("client");
 
+    tcase_add_test(tc_client, test_parse_size);
     tcase_add_test(tc_client, test_parse_extensions);
     tcase_add_test(tc_client, test_header_callback);
     tcase_add_test(tc_client, test_client_getters);
