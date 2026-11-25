@@ -138,14 +138,41 @@ static size_t client_init_header_callback(char *buffer, size_t size, size_t nite
     return bytes;
 }
 
-vectus_client vectus_client_init(const char *url) {
+/**
+ * Whether a Tus-Version list such as "1.0.0,0.2.2" offers 1.0.0, the version vectus speaks
+ */
+static int offers_tus_1_0_0(const char *versions) {
+    while (*versions != '\0') {
+        size_t len;
+
+        versions += strspn(versions, " \t,");
+        len = strcspn(versions, " \t,");
+        if (len == 5 && strncmp(versions, "1.0.0", 5) == 0) return 1;
+        versions += len;
+    }
+    return 0;
+}
+
+const char *vectus_strerror(vectus_code code) {
+    switch (code) {
+    case VECTUS_OK: return "no error";
+    case VECTUS_ERR_MEMORY: return "out of memory";
+    case VECTUS_ERR_TRANSPORT: return "could not reach the server";
+    case VECTUS_ERR_HTTP_STATUS: return "the server answered with an unexpected HTTP status";
+    case VECTUS_ERR_PROTOCOL: return "the server does not offer tus 1.0.0";
+    }
+    return "unknown error";
+}
+
+vectus_code vectus_client_init(vectus_client *client, const char *url) {
     vectus_client v = calloc(1, sizeof(struct vectus_client_s));  /* zeroed, so cleanup is safe when the server sends no Tus-Version */
+    vectus_code code = VECTUS_ERR_MEMORY;
     CURL *c = NULL;
-    CURLcode res;
     long status = 0;
 
+    *client = NULL;
     if (v == NULL) {
-        return NULL;
+        return VECTUS_ERR_MEMORY;
     }
 
     v->url = calloc(strlen(url) + 1, sizeof(char));
@@ -160,24 +187,31 @@ vectus_client vectus_client_init(const char *url) {
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, client_init_header_callback);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) v);
 
-    res = curl_easy_perform(c);
-    if (res != CURLE_OK) {
-        fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
+    /* shortcut: every curl failure becomes VECTUS_ERR_TRANSPORT; split it when callers need to tell DNS, connection and TLS errors apart */
+    code = VECTUS_ERR_TRANSPORT;
+    if (curl_easy_perform(c) != CURLE_OK) {
         goto fail;
     }
 
+    code = VECTUS_ERR_HTTP_STATUS;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
     if (status < 200 || status > 299) {  /* tus servers answer OPTIONS with 200 or 204 */
         goto fail;
     }
 
+    code = VECTUS_ERR_PROTOCOL;
+    if (v->version == NULL || !offers_tus_1_0_0(v->version)) {
+        goto fail;
+    }
+
     curl_easy_cleanup(c);
-    return v;
+    *client = v;
+    return VECTUS_OK;
 
 fail:
     curl_easy_cleanup(c);  /* no-op on NULL */
     vectus_client_cleanup(v);
-    return NULL;
+    return code;
 }
 
 void vectus_client_cleanup(vectus_client client) {
