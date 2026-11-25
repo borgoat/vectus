@@ -4,6 +4,8 @@
 "Tus-Extension:"
 "tus-extension:"
 "Tus-Resumable:"
+"Tus-Max-Size:"
+"creation-defer-length"
 "creation"
 "creation-with-upload"
 "termination"

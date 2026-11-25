@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -62,6 +63,8 @@ static unsigned int parse_extensions(char *extensions) {
             ext_flag |= VECTUS_EXT_EXPIRATION;
         } else if (strcmp(current, "checksum") == 0) {
             ext_flag |= VECTUS_EXT_CHECKSUM;
+        } else if (strcmp(current, "creation-defer-length") == 0) {
+            ext_flag |= VECTUS_EXT_CREATION_DEFER_LENGTH;
         }
 
         if (next == NULL) break;
@@ -101,6 +104,13 @@ static void client_parse_header(vectus_client v, char *line) {
         /* TODO */
     } else if (curl_strequal(line, "Tus-Extension")) {
         v->extensions = parse_extensions(value);
+    } else if (curl_strequal(line, "Tus-Max-Size")) {
+        /* Digits only: strtoull would also accept a sign and wrap "-1" around to the maximum */
+        if (*value != '\0' && value[strspn(value, "0123456789")] == '\0') {
+            errno = 0;
+            v->max_size = strtoull(value, NULL, 10);
+            if (errno == ERANGE) v->max_size = 0;  /* 0 means no known limit */
+        }
     }
 }
 
