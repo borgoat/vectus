@@ -28,14 +28,14 @@ typedef struct vectus_client_s *vectus_client;
  * Create a vectus_client pointing to the given tus server url.
  * Once done, release the client with vectus_client_cleanup
  *
- * @return a vectus_client
+ * @return a vectus_client, or NULL if out of memory, the server is unreachable or it does not answer OPTIONS with a 2xx
  */
 vectus_client vectus_client_init(const char *url);
 
 /**
  * Free up a vectus_client instance
  *
- * @param client the vectus_client to cleanup
+ * @param client the vectus_client to cleanup, or NULL to do nothing
  */
 void vectus_client_cleanup(vectus_client client);
 
