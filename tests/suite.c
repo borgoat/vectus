@@ -4,12 +4,14 @@
 
 #include "client.c"
 #include "upload.c"
+#include "resume.c"
 
 Suite *vectus_suite(void) {
     Suite *s;
     TCase *tc_client;
     TCase *tc_upload;
     TCase *tc_live;
+    TCase *tc_resume;
 
     s = suite_create("vectus");
     tc_client = tcase_create("client");
@@ -56,6 +58,15 @@ Suite *vectus_suite(void) {
         tcase_add_test(tc_live, test_upload_live_gone);
         tcase_add_test(tc_live, test_upload_live_too_large);
         suite_add_tcase(s, tc_live);
+    }
+
+    if (getenv("VECTUS_TEST_TOXIPROXY") != NULL && getenv("VECTUS_TEST_PROXIED_URL") != NULL) {
+        tc_resume = tcase_create("resume");
+        tcase_set_timeout(tc_resume, 120);
+        tcase_add_test(tc_resume, test_resume_after_cut);
+        tcase_add_test(tc_resume, test_resume_after_stall);
+        tcase_add_test(tc_resume, test_resume_repeatedly);
+        suite_add_tcase(s, tc_resume);
     }
 
     return s;

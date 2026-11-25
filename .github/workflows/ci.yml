@@ -40,28 +40,24 @@ jobs:
   e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    services:
-      tusd:
-        image: tusproject/tusd:v2.10.3
-        ports:
-          - 8080:8080
     steps:
       - uses: actions/checkout@v7
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev check pkg-config
       - run: cmake -B build && cmake --build build
-      - name: Wait for tusd
-        run: timeout 60 sh -c 'until curl -fsS -X OPTIONS -o /dev/null http://localhost:8080/files/; do sleep 1; done'
-      - name: Run the tests, including the live ones
+      # Not a services: block, which cannot pass tusd its -max-size flag or wire up the proxy
+      - name: Start tusd and Toxiproxy
+        run: tests/e2e-env.sh >> "$GITHUB_ENV"
+      - name: Run the tests, including the live and resume ones
         shell: bash
         run: |
           ctest --test-dir build --output-on-failure --verbose | tee ctest.log
           # ctest passes the same when live tests are skipped, so check each one really ran
           for test in test_vectus_client_init test_upload_live test_upload_live_empty test_upload_live_resume \
-                      test_upload_live_length_mismatch test_upload_live_gone test_upload_live_too_large; do
+                      test_upload_live_length_mismatch test_upload_live_gone test_upload_live_too_large \
+                      test_resume_after_cut test_resume_after_stall test_resume_repeatedly; do
             grep -q ":$test:0: Passed" ctest.log || { echo "$test did not pass"; exit 1; }
           done
         env:
-          VECTUS_TEST_URL: http://localhost:8080/files/
           CK_VERBOSITY: verbose
 
   fuzz:
