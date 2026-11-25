@@ -17,9 +17,22 @@ extern "C" {
  */
 typedef struct vectus_upload_s *vectus_upload;
 
+/**
+ * Create a vectus_upload reading its bytes from read_callback.
+ * Once done, release it with vectus_upload_cleanup
+ *
+ * @return a vectus_upload, or NULL if out of memory
+ */
 vectus_upload vectus_upload_create(curl_read_callback read_callback);
 
-typedef struct vecuts_uploader_s *vectus_uploader;
+/**
+ * Free up a vectus_upload instance
+ *
+ * @param upload the vectus_upload to cleanup
+ */
+void vectus_upload_cleanup(vectus_upload upload);
+
+typedef struct vectus_uploader_s *vectus_uploader;
 
 #ifdef __cplusplus
 }
