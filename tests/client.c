@@ -50,6 +50,20 @@ START_TEST(test_header_callback)
 }
 END_TEST
 
+START_TEST(test_client_getters)
+{
+    vectus_client c = calloc(1, sizeof *c);
+
+    feed_header(c, "Tus-Extension: creation,termination\r\n");
+    feed_header(c, "Tus-Max-Size: 1073741824\r\n");
+    ck_assert_uint_eq(vectus_client_extensions(c), VECTUS_EXT_CREATION | VECTUS_EXT_TERMINATION);
+    ck_assert(vectus_client_max_size(c) == 1073741824ULL);
+    ck_assert_uint_eq(vectus_client_extensions(NULL), 0);
+    ck_assert(vectus_client_max_size(NULL) == 0);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
 START_TEST(test_cleanup_without_headers)
 {
     vectus_client c = calloc(1, sizeof *c);

@@ -11,6 +11,7 @@ Suite *vectus_suite(void) {
 
     tcase_add_test(tc_client, test_parse_extensions);
     tcase_add_test(tc_client, test_header_callback);
+    tcase_add_test(tc_client, test_client_getters);
     tcase_add_test(tc_client, test_cleanup_without_headers);
     tcase_add_test(tc_client, test_offers_tus_1_0_0);
     tcase_add_test(tc_client, test_strerror);
