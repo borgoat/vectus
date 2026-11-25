@@ -214,6 +214,14 @@ fail:
     return code;
 }
 
+unsigned int vectus_client_extensions(vectus_client client) {
+    return client != NULL ? client->extensions : 0;
+}
+
+unsigned long long vectus_client_max_size(vectus_client client) {
+    return client != NULL ? client->max_size : 0;
+}
+
 void vectus_client_cleanup(vectus_client client) {
     if (client == NULL) {
         return;

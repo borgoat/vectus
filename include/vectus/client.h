@@ -54,6 +54,20 @@ typedef struct vectus_client_s *vectus_client;
 vectus_code vectus_client_init(vectus_client *client, const char *url);
 
 /**
+ * The tus extensions the server offers
+ *
+ * @return VECTUS_EXT_* flags, 0 for a NULL client
+ */
+unsigned int vectus_client_extensions(vectus_client client);
+
+/**
+ * The largest upload the server accepts, from its Tus-Max-Size header
+ *
+ * @return the size in bytes, 0 when the server gives no limit or for a NULL client
+ */
+unsigned long long vectus_client_max_size(vectus_client client);
+
+/**
  * Free up a vectus_client instance
  *
  * @param client the vectus_client to cleanup, or NULL to do nothing
