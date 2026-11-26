@@ -565,6 +565,49 @@ START_TEST(test_upload_fake_terminate)
 }
 END_TEST
 
+START_TEST(test_upload_fake_bodies_discarded)
+{
+    /* Servers may answer with a body, such as tusd's error text, which must not end up on the application's stdout */
+#define WITH_BODY(status, headers) "HTTP/1.1 " status "\r\n" headers "Connection: close\r\n\r\nbody on stdout"
+    const char *responses[] = {
+        WITH_BODY("200 OK", "Tus-Version: 1.0.0\r\nTus-Extension: creation\r\n"),
+        WITH_BODY("201 Created", "Location: /files/abc\r\n"),
+        WITH_BODY("404 Not Found", ""),
+        NULL,
+    };
+#undef WITH_BODY
+    FILE *captured = tmpfile();
+    struct source source = {0};
+    struct fake_server server;
+    vectus_client c = NULL;
+    vectus_upload u = NULL;
+    vectus_code init_code;
+    vectus_code code = VECTUS_OK;
+    int saved_stdout;
+
+    ck_assert_ptr_nonnull(captured);
+    fake_server_start(&server, responses);
+    fflush(stdout);
+    saved_stdout = dup(STDOUT_FILENO);
+    dup2(fileno(captured), STDOUT_FILENO);
+    init_code = vectus_client_init(&c, server.url);
+    if (init_code == VECTUS_OK && vectus_upload_create(&u, source_read, NULL, &source, 5) == VECTUS_OK) {
+        code = vectus_upload_perform(c, u);
+    }
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);  /* back before any assertion, so failures stay visible */
+    close(saved_stdout);
+    fake_server_stop(&server);
+
+    ck_assert_int_eq(init_code, VECTUS_OK);
+    ck_assert_int_eq(code, VECTUS_ERR_GONE);
+    ck_assert_int_eq((int) lseek(fileno(captured), 0, SEEK_END), 0);
+    fclose(captured);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
 START_TEST(test_upload_fake_create_errors)
 {
     const struct expectation cases[] = {

@@ -81,6 +81,12 @@ size_t vectus_parse_header_line(const char *buffer, size_t bytes, void (*handle)
     return bytes;
 }
 
+size_t vectus_discard_body(char *buffer, size_t size, size_t nitems, void *userdata) {
+    (void) buffer;
+    (void) userdata;
+    return size * nitems;
+}
+
 int vectus_parse_size(const char *value, unsigned long long *size) {
     unsigned long long parsed;
 
@@ -186,6 +192,7 @@ vectus_code vectus_client_init(vectus_client *client, const char *url) {
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, v->stall_timeout);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, client_init_header_callback);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) v);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, vectus_discard_body);
 
     /* shortcut: every curl failure becomes VECTUS_ERR_TRANSPORT; split it when callers need to tell DNS, connection and TLS errors apart */
     code = VECTUS_ERR_TRANSPORT;

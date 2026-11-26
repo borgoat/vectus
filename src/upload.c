@@ -166,6 +166,7 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, upload_header_callback);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) response);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, vectus_discard_body);
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);  /* give up on a stalled connection, so the upload can resume */
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, client->stall_timeout);
     switch (method) {
