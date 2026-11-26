@@ -172,3 +172,5 @@ compile_commands.json
 /builddir
 
 # End of https://www.toptal.com/developers/gitignore/api/meson,c,clion+all
+
+.cache/
