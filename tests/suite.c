@@ -47,6 +47,7 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_upload, test_upload_fake_metadata);
     tcase_add_test(tc_upload, test_upload_fake_create_with_upload);
     tcase_add_test(tc_upload, test_upload_fake_create_with_upload_retry);
+    tcase_add_test(tc_upload, test_upload_fake_deferred);
     tcase_add_test(tc_upload, test_upload_fake_expires);
     tcase_add_test(tc_upload, test_upload_fake_terminate);
     tcase_add_test(tc_upload, test_upload_fake_bodies_discarded);
@@ -63,6 +64,7 @@ Suite *vectus_suite(void) {
         tcase_set_timeout(tc_live, 60);
         tcase_add_test(tc_live, test_upload_live);
         tcase_add_test(tc_live, test_upload_live_small);
+        tcase_add_test(tc_live, test_upload_live_deferred);
         tcase_add_test(tc_live, test_upload_live_empty);
         tcase_add_test(tc_live, test_upload_live_resume);
         tcase_add_test(tc_live, test_upload_live_length_mismatch);
@@ -75,6 +77,7 @@ Suite *vectus_suite(void) {
         tc_resume = tcase_create("resume");
         tcase_set_timeout(tc_resume, 120);
         tcase_add_test(tc_resume, test_resume_after_cut);
+        tcase_add_test(tc_resume, test_resume_deferred_after_cut);
         tcase_add_test(tc_resume, test_resume_after_stall);
         tcase_add_test(tc_resume, test_resume_repeatedly);
         suite_add_tcase(s, tc_resume);

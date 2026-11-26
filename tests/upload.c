@@ -43,6 +43,9 @@ static size_t source_read(char *buffer, size_t size, size_t nitems, void *userda
     if (s->failure != SOURCE_FINE && s->position >= s->fail_at) {
         return s->failure == SOURCE_ABORTS ? VECTUS_READ_ABORT : 0;
     }
+    if (s->failure == SOURCE_ENDS_EARLY && n > s->fail_at - s->position) {
+        n = (size_t) (s->fail_at - s->position);  /* a stream exactly fail_at bytes long */
+    }
     if (s->hook != NULL && s->position >= s->hook_at) {
         void (*hook)(void) = s->hook;
 
@@ -125,9 +128,22 @@ static void fake_server_read_request(int conn, int out) {
     if (end == NULL) return;
 
     for (p = buffer; p < end; p++) *p = (char) tolower((unsigned char) *p);
+    have = used - (size_t) (end + 4 - buffer);
+    if (strstr(buffer, "\ntransfer-encoding: chunked") != NULL) {
+        /* shortcut: done once what arrived ends with the last chunk, which holds for the small bodies the tests send */
+        memmove(buffer, end + 4, have);
+        while (!(have >= 5 && memcmp(buffer + have - 5, "0\r\n\r\n", 5) == 0) && have < sizeof buffer) {
+            ssize_t n = read(conn, buffer + have, sizeof buffer - have);
+
+            if (n <= 0) break;
+            write_all(out, buffer + have, (size_t) n);
+            have += (size_t) n;
+        }
+        return;
+    }
     p = strstr(buffer, "\ncontent-length:");
     if (p != NULL) body = strtoull(p + strlen("\ncontent-length:"), NULL, 10);
-    for (have = used - (size_t) (end + 4 - buffer); have < body;) {
+    while (have < body) {
         ssize_t n = read(conn, buffer, sizeof buffer);
 
         if (n <= 0) break;
@@ -202,20 +218,29 @@ struct fake_run {
     vectus_code code;
 };
 
-/* Perform an upload of "hello" against canned responses; with resume set, the upload already exists at /files/abc */
-static void fake_run(struct fake_run *run, const char *const *responses, struct source *source, vectus_seek_callback seek, int resume) {
+/*
+ * Perform an upload of "hello" against canned responses, announced as length bytes, with the server offering extensions
+ * on top of test_client's; with resume set, the upload already exists at /files/abc
+ */
+static void fake_run_with(struct fake_run *run, const char *const *responses, struct source *source, vectus_seek_callback seek, int resume,
+                          unsigned long long length, unsigned int extensions) {
     char url[96];
 
     source->text = "hello";
     fake_server_start(&run->server, responses);
     run->client = test_client(run->server.url);
-    ck_assert_int_eq(vectus_upload_create(&run->upload, source_read, seek, source, 5), VECTUS_OK);
+    run->client->extensions |= extensions;
+    ck_assert_int_eq(vectus_upload_create(&run->upload, source_read, seek, source, length), VECTUS_OK);
     if (resume) {
         snprintf(url, sizeof url, "http://127.0.0.1:%d/files/abc", run->server.port);
         ck_assert_int_eq(vectus_upload_set_url(run->upload, url), VECTUS_OK);
     }
     run->code = vectus_upload_perform(run->client, run->upload);
     run->seen = fake_server_stop(&run->server);
+}
+
+static void fake_run(struct fake_run *run, const char *const *responses, struct source *source, vectus_seek_callback seek, int resume) {
+    fake_run_with(run, responses, source, seek, resume, 5, 0);
 }
 
 static void fake_run_cleanup(struct fake_run *run) {
@@ -306,6 +331,17 @@ START_TEST(test_upload_read_wrapper)
     ck_assert(u->source_failed);
     ck_assert(u->position == 0);
     vectus_upload_cleanup(u);
+
+    /* Without a length, the stream ending is the end of the upload */
+    memset(&source, 0, sizeof source);
+    source.failure = SOURCE_ENDS_EARLY;
+    source.fail_at = 7;
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
+    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), 7);
+    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), 0);
+    ck_assert(!u->source_failed);
+    ck_assert(u->length == 7);
+    vectus_upload_cleanup(u);
 }
 END_TEST
 
@@ -324,8 +360,17 @@ START_TEST(test_upload_create_and_urls)
     ck_assert_str_eq(vectus_upload_url(u), "http://h/files/abc");
     ck_assert_int_eq(vectus_upload_set_url(u, NULL), VECTUS_OK);
     ck_assert_ptr_null(vectus_upload_url(u));
+    ck_assert(u->length == UPLOAD_MAX_LENGTH);
     vectus_upload_cleanup(u);
     vectus_upload_cleanup(NULL);
+
+    /* A deferred upload forgets a length it learnt about another URL */
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
+    ck_assert(!u->length_declared);
+    u->length = 5;
+    ck_assert_int_eq(vectus_upload_set_url(u, "http://h/files/abc"), VECTUS_OK);
+    ck_assert(u->length == VECTUS_LENGTH_UNKNOWN);
+    vectus_upload_cleanup(u);
 }
 END_TEST
 
@@ -421,6 +466,13 @@ START_TEST(test_upload_extensions_required)
     ck_assert_int_eq(vectus_upload_set_url(u, "http://127.0.0.1:1/files/abc"), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_ERR_UNSUPPORTED);
     ck_assert_str_eq(vectus_upload_url(u), "http://127.0.0.1:1/files/abc");
+    vectus_upload_cleanup(u);
+
+    c->max_size = 10;  /* an unknown length is not over it */
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_UNSUPPORTED);  /* no creation-defer-length */
+    c->extensions |= VECTUS_EXT_CREATION_DEFER_LENGTH;
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_TRANSPORT);  /* gets as far as asking */
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
 }
@@ -626,6 +678,65 @@ START_TEST(test_upload_fake_create_with_upload_retry)
     ck_assert(vectus_upload_offset(u) == 5);
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_fake_deferred)
+{
+#define DEFER_HEAD(headers) RESPONSE("200 OK", "Upload-Offset: " headers)
+#define OFFSET(n) RESPONSE("204 No Content", "Upload-Offset: " #n "\r\n")
+    const struct {
+        const char *responses[4];
+        int resume;
+        unsigned long long stream;  /* how much of "hello" the stream delivers before it ends */
+        vectus_code code;
+        int patches;
+        int declares;               /* how many requests carry Upload-Length */
+        const char *expect[3];      /* each sent exactly once */
+    } cases[] = {
+        /* The stream goes chunked, then an empty PATCH declares its length */
+        {{CREATED, OFFSET(5), OFFSET(5), NULL}, 0, 5, VECTUS_OK, 2, 1,
+         {"5\r\nhello\r\n0\r\n\r\n", "Upload-Length: 5\r\n", "Upload-Offset: 5\r\n"}},
+        /* The server kept part of the stream, so the PATCH with the rest declares the length too */
+        {{CREATED, OFFSET(3), OFFSET(5), NULL}, 0, 5, VECTUS_OK, 2, 1,
+         {"Upload-Offset: 3\r\n", "Content-Length: 2\r\n", "\r\n\r\nlo"}},
+        {{CREATED, OFFSET(0), OFFSET(0), NULL}, 0, 0, VECTUS_OK, 2, 1,
+         {"\r\n\r\n0\r\n\r\n", "Upload-Length: 0\r\n", NULL}},
+        /* Resuming while the server still waits for the length */
+        {{DEFER_HEAD("2\r\nUpload-Defer-Length: 1\r\n"), OFFSET(5), OFFSET(5), NULL}, 1, 5, VECTUS_OK, 2, 1,
+         {"3\r\nllo\r\n0\r\n\r\n", "Upload-Offset: 5\r\n", NULL}},
+        /* The length was declared, but its response lost: nothing left to send or declare */
+        {{DEFER_HEAD("5\r\nUpload-Length: 5\r\n"), NULL}, 1, 5, VECTUS_OK, 0, 0, {NULL}},
+        /* Resuming with the length declared earlier: a plain PATCH of the rest */
+        {{DEFER_HEAD("2\r\nUpload-Length: 5\r\n"), OFFSET(5), NULL}, 1, 5, VECTUS_OK, 1, 0,
+         {"Content-Length: 3\r\n", "\r\n\r\nllo", NULL}},
+        /* The server was told more than the stream holds */
+        {{DEFER_HEAD("0\r\nUpload-Length: 9\r\n"), OFFSET(9), NULL}, 1, 5, VECTUS_ERR_SOURCE, 1, 0, {NULL}},
+    };
+#undef DEFER_HEAD
+#undef OFFSET
+    size_t i;
+    size_t j;
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        struct source source = {0};
+        struct fake_run run;
+
+        source.failure = SOURCE_ENDS_EARLY;
+        source.fail_at = cases[i].stream;
+        fake_run_with(&run, cases[i].responses, &source, source_seek, cases[i].resume, VECTUS_LENGTH_UNKNOWN,
+                      VECTUS_EXT_CREATION_DEFER_LENGTH);
+        ck_assert_msg(run.code == cases[i].code, "case %zu: %s", i, vectus_strerror(run.code));
+        ck_assert_msg(count(run.seen, "PATCH") == cases[i].patches, "case %zu: %d PATCH", i, count(run.seen, "PATCH"));
+        ck_assert_msg(count(run.seen, "Upload-Length:") == cases[i].declares, "case %zu: %d Upload-Length", i,
+                      count(run.seen, "Upload-Length:"));
+        ck_assert_int_eq(count(run.seen, "Upload-Defer-Length: 1\r\n"), cases[i].resume ? 0 : 1);
+        for (j = 0; j < sizeof cases[i].expect / sizeof cases[i].expect[0] && cases[i].expect[j] != NULL; j++) {
+            ck_assert_msg(count(run.seen, cases[i].expect[j]) == 1, "case %zu: %s", i, cases[i].expect[j]);
+        }
+        if (run.code == VECTUS_OK) ck_assert(vectus_upload_offset(run.upload) == cases[i].stream);
+        fake_run_cleanup(&run);
+    }
 }
 END_TEST
 
@@ -981,6 +1092,24 @@ START_TEST(test_upload_live_small)
     ck_assert(vectus_upload_offset(u) == 1000);
     ck_assert_int_eq(source.seeks, 0);
     assert_uploaded(vectus_upload_url(u), 1000);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_live_deferred)
+{
+    struct source source = {0};
+    vectus_client c = live_client("VECTUS_TEST_URL");
+    vectus_upload u;
+
+    ck_assert(vectus_client_extensions(c) & VECTUS_EXT_CREATION_DEFER_LENGTH);
+    source.failure = SOURCE_ENDS_EARLY;  /* announced without a length, so this is where the upload ends */
+    source.fail_at = 4 * MIB + 7;
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
+    ck_assert(vectus_upload_offset(u) == 4 * MIB + 7);
+    assert_uploaded(vectus_upload_url(u), 4 * MIB + 7);
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
 }

@@ -18,8 +18,17 @@ extern "C" {
 #define VECTUS_READ_ABORT ((size_t) -1)
 
 /**
+ * Pass as the length to vectus_upload_create when it is not known yet, such as for a pipe; the upload then ends where
+ * the read callback returns 0. Needs a server offering creation-defer-length.
+ * When resuming, a length the server was already told is trusted, and the stream is read only up to it.
+ * A read callback blocking longer than the stall timeout (30 seconds) fails the request with VECTUS_ERR_TRANSPORT
+ */
+#define VECTUS_LENGTH_UNKNOWN ((unsigned long long) -1)
+
+/**
  * Called for the next bytes to upload: write at most size * nitems bytes into buffer and return how many were written.
- * The stream starts at the upload's first byte and must deliver exactly its length; return VECTUS_READ_ABORT to give up.
+ * The stream starts at the upload's first byte and must deliver exactly its length, or end by returning 0 when the
+ * length is VECTUS_LENGTH_UNKNOWN; return VECTUS_READ_ABORT to give up.
  */
 typedef size_t (*vectus_read_callback)(char *buffer, size_t size, size_t nitems, void *userdata);
 
@@ -43,7 +52,7 @@ typedef struct vectus_upload_s *vectus_upload;
  * @param read_callback delivers the bytes to upload
  * @param seek_callback moves the stream when resuming mid-way, or NULL if it cannot; resuming mid-way then fails with VECTUS_ERR_SOURCE
  * @param userdata passed to both callbacks
- * @param length the number of bytes to upload
+ * @param length the number of bytes to upload, or VECTUS_LENGTH_UNKNOWN
  * @return VECTUS_OK, VECTUS_ERR_MEMORY, or VECTUS_ERR_TOO_LARGE if length does not fit curl's signed 64-bit size
  */
 vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback read_callback, vectus_seek_callback seek_callback,
@@ -58,7 +67,7 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
  * call it again to resume where the server stopped.
  *
  * @return VECTUS_OK once the server has every byte, VECTUS_ERR_UNSUPPORTED when the upload has no URL and the server
- *         does not offer the creation extension, or why it stopped
+ *         does not offer the creation extension (or creation-defer-length, for VECTUS_LENGTH_UNKNOWN), or why it stopped
  */
 vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload);
 

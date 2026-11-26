@@ -31,9 +31,19 @@ struct vectus_upload_s {
     void *userdata;
 
     /**
-     * the number of bytes to upload
+     * the number of bytes to upload, VECTUS_LENGTH_UNKNOWN until a deferred upload learns it
      */
     unsigned long long length;
+
+    /**
+     * set when created with VECTUS_LENGTH_UNKNOWN: the length comes from the stream's end, or from the server when resuming
+     */
+    int deferred;
+
+    /**
+     * whether the server knows the length; a deferred upload's next PATCH declares it once the stream has ended
+     */
+    int length_declared;
 
     /**
      * how far the byte stream has been read
@@ -76,6 +86,7 @@ struct upload_response {
     unsigned long long offset;
     int has_length;
     unsigned long long length;
+    int length_deferred;  /* Upload-Defer-Length: 1, the server still waits for the length */
     time_t expires;  /* 0 when absent or not a date */
 };
 
@@ -92,6 +103,8 @@ static void upload_handle_header(void *target, const char *name, char *value) {
         response->has_offset = vectus_parse_size(value, &response->offset);
     } else if (curl_strequal(name, "Upload-Length")) {
         response->has_length = vectus_parse_size(value, &response->length);
+    } else if (curl_strequal(name, "Upload-Defer-Length")) {
+        response->length_deferred = strcmp(value, "1") == 0;
     } else if (curl_strequal(name, "Upload-Expires")) {
         time_t expires = curl_getdate(value, NULL);  /* -1 when it is not a date */
 
@@ -118,6 +131,10 @@ static size_t upload_read_callback(char *buffer, size_t size, size_t nitems, voi
     }
 
     bytes = upload->read_callback(buffer, 1, wanted, upload->userdata);
+    if (bytes == 0 && upload->length == VECTUS_LENGTH_UNKNOWN) {
+        upload->length = upload->position;  /* the end of a stream announced without a length */
+        return 0;
+    }
     if (bytes == 0 || bytes > wanted) {  /* VECTUS_READ_ABORT, the data ending before length, or a broken callback */
         upload->source_failed = 1;
         return CURL_READFUNC_ABORT;
@@ -148,6 +165,13 @@ static struct curl_slist *upload_add_header(struct curl_slist *headers, const ch
  */
 static int upload_creates_with_data(vectus_client client, vectus_upload upload) {
     return (client->extensions & VECTUS_EXT_CREATION_WITH_UPLOAD) && upload->length > 0 && upload->length <= UPLOAD_CREATION_DATA_MAX;
+}
+
+/**
+ * Whether the next PATCH declares a deferred upload's length: the stream has ended, and the server still waits for it
+ */
+static int upload_declares_length(vectus_upload upload) {
+    return upload->deferred && !upload->length_declared && upload->length != VECTUS_LENGTH_UNKNOWN;
 }
 
 /**
@@ -183,12 +207,20 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
 
     headers = upload_add_header(headers, "Tus-Resumable: 1.0.0", &failed);
     if (method == UPLOAD_POST) {
-        snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
-        headers = upload_add_header(headers, header, &failed);
+        if (upload->length == VECTUS_LENGTH_UNKNOWN) {
+            headers = upload_add_header(headers, "Upload-Defer-Length: 1", &failed);
+        } else {
+            snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
+            headers = upload_add_header(headers, header, &failed);
+        }
         if (upload->metadata != NULL) headers = upload_add_header(headers, upload->metadata, &failed);
     } else if (method == UPLOAD_PATCH) {
         snprintf(header, sizeof header, "Upload-Offset: %llu", upload->offset);
         headers = upload_add_header(headers, header, &failed);
+        if (upload_declares_length(upload)) {
+            snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
+            headers = upload_add_header(headers, header, &failed);
+        }
     }
     if (with_data) {
         headers = upload_add_header(headers, "Content-Type: application/offset+octet-stream", &failed);
@@ -223,7 +255,9 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
     case UPLOAD_PATCH:
         curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PATCH");
-        curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t) (upload->length - upload->offset));
+        if (upload->length != VECTUS_LENGTH_UNKNOWN) {  /* otherwise curl sends the stream chunked */
+            curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t) (upload->length - upload->offset));
+        }
         break;
     case UPLOAD_DELETE:
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
@@ -299,6 +333,7 @@ static vectus_code upload_create_remote(vectus_client client, vectus_upload uplo
         upload->url = upload_resolve_url(client->url, response.location);
         upload->offset = 0;
         upload->expires = response.expires;
+        upload->length_declared = upload->length != VECTUS_LENGTH_UNKNOWN;
         if (upload->url == NULL) {
             code = VECTUS_ERR_PROTOCOL;
         } else if (with_data && (!response.has_offset || response.offset > upload->length)) {
@@ -324,10 +359,13 @@ static vectus_code upload_fetch_offset(vectus_client client, vectus_upload uploa
         code = VECTUS_ERR_GONE;
     } else if (response.status != 200 && response.status != 204) {
         code = VECTUS_ERR_HTTP_STATUS;
-    } else if (!response.has_offset || response.offset > upload->length
-               || (response.has_length && response.length != upload->length)) {
+    } else if (!response.has_offset
+               || (response.has_length && upload->length != VECTUS_LENGTH_UNKNOWN && response.length != upload->length)
+               || response.offset > (response.has_length ? response.length : upload->length)) {
         code = VECTUS_ERR_PROTOCOL;
     } else {
+        if (response.has_length) upload->length = response.length;  /* a deferred length declared earlier, maybe by another process */
+        upload->length_declared = !response.length_deferred;
         upload->offset = response.offset;
         if (response.expires != 0) upload->expires = response.expires;  /* servers need only send it on POST and PATCH */
     }
@@ -340,6 +378,7 @@ static vectus_code upload_fetch_offset(vectus_client client, vectus_upload uploa
  */
 static vectus_code upload_send(vectus_client client, vectus_upload upload) {
     struct upload_response response = {0};
+    int declaring = upload_declares_length(upload);  /* before the request, which may end the stream */
     vectus_code code = upload_seek(upload);
 
     if (code != VECTUS_OK) {
@@ -353,10 +392,14 @@ static vectus_code upload_send(vectus_client client, vectus_upload upload) {
         code = VECTUS_ERR_GONE;
     } else if (response.status != 204) {
         code = VECTUS_ERR_HTTP_STATUS;  /* 409 when the offset was stale; the next perform asks again */
-    } else if (!response.has_offset || response.offset <= upload->offset || response.offset > upload->length) {
-        code = VECTUS_ERR_PROTOCOL;  /* an offset that does not move forward would loop forever */
+    } else if (!response.has_offset || response.offset < upload->offset || response.offset > upload->length
+               || (response.offset == upload->offset && upload->offset < upload->length)) {
+        /* An offset going back, or standing still with data left to send, would loop forever.
+           Only a PATCH declaring the length of a fully sent stream may leave it where it is */
+        code = VECTUS_ERR_PROTOCOL;
     } else {
         upload->offset = response.offset;
+        if (declaring) upload->length_declared = 1;
         if (response.expires != 0) upload->expires = response.expires;  /* a finished upload may no longer expire */
     }
     free(response.location);
@@ -366,7 +409,7 @@ static vectus_code upload_send(vectus_client client, vectus_upload upload) {
 vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback read_callback, vectus_seek_callback seek_callback,
                                  void *userdata, unsigned long long length) {
     *upload = NULL;
-    if (length > UPLOAD_MAX_LENGTH) {
+    if (length > UPLOAD_MAX_LENGTH && length != VECTUS_LENGTH_UNKNOWN) {
         return VECTUS_ERR_TOO_LARGE;
     }
 
@@ -378,6 +421,8 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
     (*upload)->seek_callback = seek_callback;
     (*upload)->userdata = userdata;
     (*upload)->length = length;
+    (*upload)->deferred = length == VECTUS_LENGTH_UNKNOWN;
+    (*upload)->length_declared = !(*upload)->deferred;
     return VECTUS_OK;
 }
 
@@ -385,10 +430,11 @@ vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload) {
     vectus_code code;
 
     if (upload->url == NULL) {
-        if (!(client->extensions & VECTUS_EXT_CREATION)) {
+        if (!(client->extensions & VECTUS_EXT_CREATION)
+            || (upload->length == VECTUS_LENGTH_UNKNOWN && !(client->extensions & VECTUS_EXT_CREATION_DEFER_LENGTH))) {
             return VECTUS_ERR_UNSUPPORTED;
         }
-        if (client->max_size != 0 && upload->length > client->max_size) {
+        if (client->max_size != 0 && upload->length != VECTUS_LENGTH_UNKNOWN && upload->length > client->max_size) {
             return VECTUS_ERR_TOO_LARGE;
         }
         code = upload_create_remote(client, upload);
@@ -396,7 +442,7 @@ vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload) {
         code = upload_fetch_offset(client, upload);
     }
 
-    while (code == VECTUS_OK && upload->offset < upload->length) {
+    while (code == VECTUS_OK && (upload->offset < upload->length || upload_declares_length(upload))) {
         code = upload_send(client, upload);
     }
     return code;
@@ -420,6 +466,7 @@ vectus_code vectus_upload_set_url(vectus_upload upload, const char *url) {
     upload->url = copy;
     upload->offset = 0;  /* unknown until perform asks the server */
     upload->expires = 0;
+    if (upload->deferred) upload->length = VECTUS_LENGTH_UNKNOWN;  /* learnt again from the stream or the server */
     return VECTUS_OK;
 }
 

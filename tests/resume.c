@@ -79,6 +79,30 @@ START_TEST(test_resume_after_cut)
 }
 END_TEST
 
+START_TEST(test_resume_deferred_after_cut)
+{
+    struct source source = {0};
+    vectus_client c;
+    vectus_upload u;
+
+    toxics_clear();
+    c = live_client("VECTUS_TEST_PROXIED_URL");
+    source.failure = SOURCE_ENDS_EARLY;  /* a stream of unknown length, cut while sent chunked */
+    source.fail_at = 4 * MIB + 7;
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
+
+    toxic_add("cut", "limit_data", "{\"bytes\":1048576}");
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_TRANSPORT);
+    toxic_remove("cut");
+
+    perform_until_done(c, u, 5);
+    assert_resumed_mid_way(&source);
+    assert_uploaded(vectus_upload_url(u), 4 * MIB + 7);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
 START_TEST(test_resume_after_stall)
 {
     struct source source = {0};
