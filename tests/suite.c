@@ -44,6 +44,7 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_upload, test_upload_fake_create_and_send);
     tcase_add_test(tc_upload, test_upload_fake_zero_length);
     tcase_add_test(tc_upload, test_upload_fake_metadata);
+    tcase_add_test(tc_upload, test_upload_fake_expires);
     tcase_add_test(tc_upload, test_upload_fake_terminate);
     tcase_add_test(tc_upload, test_upload_fake_bodies_discarded);
     tcase_add_test(tc_upload, test_upload_fake_create_errors);

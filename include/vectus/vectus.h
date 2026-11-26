@@ -4,6 +4,7 @@
 #define VECTUS_H
 
 #include <stddef.h>
+#include <time.h>
 
 #include "client.h"
 
@@ -96,6 +97,14 @@ vectus_code vectus_upload_set_url(vectus_upload upload, const char *url);
  * How many bytes the server confirmed it has, as of the last vectus_upload_perform
  */
 unsigned long long vectus_upload_offset(vectus_upload upload);
+
+/**
+ * When the server will remove the upload if it is still unfinished, from its Upload-Expires header (the expiration extension).
+ * Store it along with the URL to skip resuming an upload the server has already removed
+ *
+ * @return seconds since the epoch, or 0 if no response about the upload's current URL gave a date
+ */
+time_t vectus_upload_expires(vectus_upload upload);
 
 /**
  * Free up a vectus_upload instance

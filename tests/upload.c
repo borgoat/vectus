@@ -254,6 +254,12 @@ START_TEST(test_upload_headers)
     feed_upload_header(&response, "Upload-Offset: -1\r\n");
     ck_assert(!response.has_offset);
     free(response.location);
+
+    memset(&response, 0, sizeof response);
+    feed_upload_header(&response, "Upload-Expires: soon\r\n");
+    ck_assert(response.expires == 0);
+    feed_upload_header(&response, "upload-expires: Wed, 25 Jun 2014 16:00:00 GMT\r\n");  /* the spec's example */
+    ck_assert(response.expires == 1403712000);
 }
 END_TEST
 
@@ -521,6 +527,37 @@ START_TEST(test_upload_fake_metadata)
     ck_assert(strstr(seen, "Upload-Metadata") < strstr(seen, "PATCH"));
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_fake_expires)
+{
+#define EXPIRES_16 "Upload-Expires: Wed, 25 Jun 2014 16:00:00 GMT\r\n"
+#define EXPIRES_17 "Upload-Expires: Wed, 25 Jun 2014 17:00:00 GMT\r\n"
+    const char *created[] = {
+        RESPONSE("201 Created", "Location: /files/abc\r\n" EXPIRES_16),
+        RESPONSE("204 No Content", "Upload-Offset: 3\r\n" EXPIRES_17),
+        RESPONSE("204 No Content", "Upload-Offset: 5\r\n"),  /* no date, so the last one holds */
+        NULL,
+    };
+    const char *resumed[] = {RESPONSE("200 OK", "Upload-Offset: 5\r\nUpload-Length: 5\r\n" EXPIRES_16), NULL};
+#undef EXPIRES_16
+#undef EXPIRES_17
+    struct source source = {0};
+    struct fake_run run;
+
+    fake_run(&run, created, &source, source_seek, 0);
+    ck_assert_int_eq(run.code, VECTUS_OK);
+    ck_assert(vectus_upload_expires(run.upload) == 1403715600);
+    ck_assert_int_eq(vectus_upload_set_url(run.upload, NULL), VECTUS_OK);
+    ck_assert(vectus_upload_expires(run.upload) == 0);  /* another URL, another upload */
+    fake_run_cleanup(&run);
+
+    memset(&source, 0, sizeof source);
+    fake_run(&run, resumed, &source, source_seek, 1);
+    ck_assert_int_eq(run.code, VECTUS_OK);
+    ck_assert(vectus_upload_expires(run.upload) == 1403712000);
+    fake_run_cleanup(&run);
 }
 END_TEST
 
