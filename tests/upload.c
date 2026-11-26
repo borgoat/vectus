@@ -385,6 +385,25 @@ START_TEST(test_upload_metadata)
 }
 END_TEST
 
+START_TEST(test_upload_creates_with_data)
+{
+    struct source source = {0};
+    vectus_client c = test_client("http://127.0.0.1:1/files/");
+    vectus_upload u;
+
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, UPLOAD_CREATION_DATA_MAX), VECTUS_OK);
+    ck_assert(!upload_creates_with_data(c, u));  /* the server does not offer it */
+    c->extensions |= VECTUS_EXT_CREATION_WITH_UPLOAD;
+    ck_assert(upload_creates_with_data(c, u));
+    u->length = UPLOAD_CREATION_DATA_MAX + 1;
+    ck_assert(!upload_creates_with_data(c, u));  /* too much to send again if the POST fails */
+    u->length = 0;
+    ck_assert(!upload_creates_with_data(c, u));
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
 START_TEST(test_upload_extensions_required)
 {
     struct source source = {0};
@@ -525,6 +544,86 @@ START_TEST(test_upload_fake_metadata)
     ck_assert_int_eq(count(seen, "\r\nUpload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential\r\n"), 1);
     ck_assert_int_eq(count(seen, "Upload-Metadata"), 1);
     ck_assert(strstr(seen, "Upload-Metadata") < strstr(seen, "PATCH"));
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_fake_create_with_upload)
+{
+    const struct {
+        const char *responses[3];
+        vectus_code code;
+        int patches;
+    } cases[] = {
+        {{RESPONSE("201 Created", "Location: /files/abc\r\nUpload-Offset: 5\r\n"), NULL}, VECTUS_OK, 0},
+        {{RESPONSE("201 Created", "Location: /files/abc\r\nUpload-Offset: 3\r\n"),  /* kept part, the rest goes in a PATCH */
+          RESPONSE("204 No Content", "Upload-Offset: 5\r\n"), NULL}, VECTUS_OK, 1},
+        {{RESPONSE("201 Created", "Location: /files/abc\r\n"), NULL}, VECTUS_ERR_PROTOCOL, 0},
+        {{RESPONSE("201 Created", "Location: /files/abc\r\nUpload-Offset: 6\r\n"), NULL}, VECTUS_ERR_PROTOCOL, 0},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        struct source source = {0};
+        struct fake_server server;
+        vectus_client c;
+        vectus_upload u;
+        vectus_code code;
+        const char *seen;
+
+        source.text = "hello";
+        fake_server_start(&server, cases[i].responses);
+        c = test_client(server.url);
+        c->extensions |= VECTUS_EXT_CREATION_WITH_UPLOAD;
+        ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, 5), VECTUS_OK);
+        code = vectus_upload_perform(c, u);
+        seen = fake_server_stop(&server);
+
+        ck_assert_msg(code == cases[i].code, "case %zu: %s", i, vectus_strerror(code));
+        ck_assert_ptr_nonnull(vectus_upload_url(u));  /* kept even after a protocol error, so the next perform asks the server */
+        ck_assert_int_eq(count(seen, "POST /files/ HTTP/1.1\r\n"), 1);
+        ck_assert_int_eq(count(seen, "Upload-Length: 5\r\n"), 1);
+        ck_assert_int_eq(count(seen, "Expect: 100-continue\r\n"), 1);
+        ck_assert_int_eq(count(seen, "Content-Type: application/offset+octet-stream\r\n"), 1 + cases[i].patches);
+        ck_assert_int_eq(count(seen, "x-www-form-urlencoded"), 0);
+        ck_assert_int_eq(count(seen, "\r\n\r\nhello"), 1);  /* the data, in the POST */
+        ck_assert_int_eq(count(seen, "PATCH"), cases[i].patches);
+        if (cases[i].patches > 0) {
+            ck_assert_int_eq(count(seen, "Upload-Offset: 3\r\n"), 1);
+            ck_assert_int_eq(count(seen, "\r\n\r\nlo"), 1);
+        }
+        if (code == VECTUS_OK) ck_assert(vectus_upload_offset(u) == 5);
+        vectus_upload_cleanup(u);
+        vectus_client_cleanup(c);
+    }
+}
+END_TEST
+
+START_TEST(test_upload_fake_create_with_upload_retry)
+{
+    /* The first POST gets no answer, so its data is lost with the URL, and the next perform sends it all again */
+    const char *responses[] = {"", RESPONSE("201 Created", "Location: /files/abc\r\nUpload-Offset: 5\r\n"), NULL};
+    struct source source = {0};
+    struct fake_server server;
+    vectus_client c;
+    vectus_upload u;
+    const char *seen;
+
+    source.text = "hello";
+    fake_server_start(&server, responses);
+    c = test_client(server.url);
+    c->extensions |= VECTUS_EXT_CREATION_WITH_UPLOAD;
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, 5), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_TRANSPORT);
+    ck_assert_ptr_null(vectus_upload_url(u));
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
+    seen = fake_server_stop(&server);
+
+    ck_assert_int_eq(source.seeks, 1);
+    ck_assert(source.first_seek == 0);
+    ck_assert_int_eq(count(seen, "\r\n\r\nhello"), 2);
+    ck_assert(vectus_upload_offset(u) == 5);
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
 }
@@ -866,6 +965,22 @@ START_TEST(test_upload_live)
     ck_assert(vectus_upload_offset(u) == 4 * MIB);
     ck_assert_int_eq(source.seeks, 0);
     assert_uploaded(vectus_upload_url(u), 4 * MIB);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_live_small)
+{
+    struct source source = {0};
+    vectus_client c = live_client("VECTUS_TEST_URL");
+    vectus_upload u;
+
+    ck_assert(vectus_client_extensions(c) & VECTUS_EXT_CREATION_WITH_UPLOAD);  /* so the data goes in the POST */
+    u = live_upload(c, &source, 1000);
+    ck_assert(vectus_upload_offset(u) == 1000);
+    ck_assert_int_eq(source.seeks, 0);
+    assert_uploaded(vectus_upload_url(u), 1000);
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
 }

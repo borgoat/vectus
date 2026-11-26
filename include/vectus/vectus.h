@@ -52,6 +52,8 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
 /**
  * Send the bytes the server does not have yet: create the upload on the server if it has no URL,
  * otherwise ask the server how many bytes it has, then send the rest.
+ * Uploads up to 1 MiB go along with the request creating them when the server offers creation-with-upload;
+ * if that request fails, the next call starts over.
  * After VECTUS_ERR_TRANSPORT or VECTUS_ERR_HTTP_STATUS, for example when the connection dropped,
  * call it again to resume where the server stopped.
  *
