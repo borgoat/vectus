@@ -71,6 +71,16 @@ struct vectus_upload_s {
     char *metadata;
 
     /**
+     * set for a partial upload, created with Upload-Concat: partial
+     */
+    int partial;
+
+    /**
+     * the whole Upload-Concat header line creating a final upload, NULL for any other
+     */
+    char *final;
+
+    /**
      * set when the read callback aborted or ended early during the current request
      */
     int source_failed;
@@ -207,12 +217,15 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
 
     headers = upload_add_header(headers, "Tus-Resumable: 1.0.0", &failed);
     if (method == UPLOAD_POST) {
-        if (upload->length == VECTUS_LENGTH_UNKNOWN) {
+        if (upload->final != NULL) {
+            headers = upload_add_header(headers, upload->final, &failed);  /* the server sums up the length */
+        } else if (upload->length == VECTUS_LENGTH_UNKNOWN) {
             headers = upload_add_header(headers, "Upload-Defer-Length: 1", &failed);
         } else {
             snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
             headers = upload_add_header(headers, header, &failed);
         }
+        if (upload->partial) headers = upload_add_header(headers, "Upload-Concat: partial", &failed);
         if (upload->metadata != NULL) headers = upload_add_header(headers, upload->metadata, &failed);
     } else if (method == UPLOAD_PATCH) {
         snprintf(header, sizeof header, "Upload-Offset: %llu", upload->offset);
@@ -426,18 +439,64 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
     return VECTUS_OK;
 }
 
+void vectus_upload_set_partial(vectus_upload upload) {
+    upload->partial = 1;
+}
+
+vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const *partial_urls, size_t count) {
+    static const char prefix[] = "Upload-Concat: final;";
+    size_t size = sizeof prefix;
+    char *end;
+    size_t i;
+
+    *upload = NULL;
+    if (count == 0) {
+        return VECTUS_ERR_INVALID;
+    }
+    /* The URLs go into the header as they are, separated by spaces */
+    for (i = 0; i < count; i++) {
+        const char *c = partial_urls[i];
+
+        if (*c == '\0') return VECTUS_ERR_INVALID;
+        for (; *c != '\0'; c++) {
+            if ((unsigned char) *c <= ' ' || (unsigned char) *c > '~') return VECTUS_ERR_INVALID;
+        }
+        size += (size_t) (c - partial_urls[i]) + 1;  /* and a space or the terminator */
+    }
+
+    *upload = calloc(1, sizeof(struct vectus_upload_s));
+    if (*upload == NULL) {
+        return VECTUS_ERR_MEMORY;
+    }
+    (*upload)->length_declared = 1;
+    (*upload)->final = malloc(size);
+    if ((*upload)->final == NULL) {
+        vectus_upload_cleanup(*upload);
+        *upload = NULL;
+        return VECTUS_ERR_MEMORY;
+    }
+    end = (*upload)->final + snprintf((*upload)->final, size, "%s%s", prefix, partial_urls[0]);
+    for (i = 1; i < count; i++) {
+        end += snprintf(end, size - (size_t) (end - (*upload)->final), " %s", partial_urls[i]);
+    }
+    return VECTUS_OK;
+}
+
 vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload) {
     vectus_code code;
 
     if (upload->url == NULL) {
         if (!(client->extensions & VECTUS_EXT_CREATION)
-            || (upload->length == VECTUS_LENGTH_UNKNOWN && !(client->extensions & VECTUS_EXT_CREATION_DEFER_LENGTH))) {
+            || (upload->length == VECTUS_LENGTH_UNKNOWN && !(client->extensions & VECTUS_EXT_CREATION_DEFER_LENGTH))
+            || ((upload->partial || upload->final != NULL) && !(client->extensions & VECTUS_EXT_CONCATENATION))) {
             return VECTUS_ERR_UNSUPPORTED;
         }
         if (client->max_size != 0 && upload->length != VECTUS_LENGTH_UNKNOWN && upload->length > client->max_size) {
             return VECTUS_ERR_TOO_LARGE;
         }
         code = upload_create_remote(client, upload);
+    } else if (upload->final != NULL) {
+        return VECTUS_OK;  /* the server assembled it: nothing to send, and a PATCH would get 403 */
     } else {
         code = upload_fetch_offset(client, upload);
     }
@@ -573,5 +632,6 @@ void vectus_upload_cleanup(vectus_upload upload) {
     }
     free(upload->url);
     free(upload->metadata);
+    free(upload->final);
     free(upload);
 }

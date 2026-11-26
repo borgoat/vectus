@@ -59,6 +59,25 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
                                  void *userdata, unsigned long long length);
 
 /**
+ * Mark the upload as a partial one, uploaded like any other, then joined with others by vectus_upload_create_final.
+ * Call it before vectus_upload_perform creates the upload, which then needs a server offering concatenation
+ */
+void vectus_upload_set_partial(vectus_upload upload);
+
+/**
+ * Create a vectus_upload that vectus_upload_perform turns into the concatenation of finished partial uploads.
+ * The server assembles it, so the client has no bytes to send: its length and offset stay 0, and once it has a URL,
+ * perform does nothing. The server does not copy the partial uploads' metadata, so add it to this one.
+ * Once done, release it with vectus_upload_cleanup
+ *
+ * @param upload set to the new vectus_upload on success, to NULL otherwise
+ * @param partial_urls the partial uploads' URLs, such as from vectus_upload_url, in the order to join them
+ * @param count how many partial_urls there are, at least 1
+ * @return VECTUS_OK, VECTUS_ERR_INVALID for no URLs, or a URL empty or with spaces or control characters, or VECTUS_ERR_MEMORY
+ */
+vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const *partial_urls, size_t count);
+
+/**
  * Send the bytes the server does not have yet: create the upload on the server if it has no URL,
  * otherwise ask the server how many bytes it has, then send the rest.
  * Uploads up to 1 MiB go along with the request creating them when the server offers creation-with-upload;
@@ -67,7 +86,8 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
  * call it again to resume where the server stopped.
  *
  * @return VECTUS_OK once the server has every byte, VECTUS_ERR_UNSUPPORTED when the upload has no URL and the server
- *         does not offer the creation extension (or creation-defer-length, for VECTUS_LENGTH_UNKNOWN), or why it stopped
+ *         does not offer the creation extension (or creation-defer-length, for VECTUS_LENGTH_UNKNOWN, or concatenation,
+ *         for partial and final uploads), or why it stopped
  */
 vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload);
 

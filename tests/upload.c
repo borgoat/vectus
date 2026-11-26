@@ -24,6 +24,7 @@ enum source_failure { SOURCE_FINE, SOURCE_ABORTS, SOURCE_ENDS_EARLY };
 /* The data to upload: source_byte, or text when set */
 struct source {
     const char *text;
+    unsigned long long base;        /* where in source_byte the stream starts, for a part of a larger upload */
     unsigned long long position;
     enum source_failure failure;
     unsigned long long fail_at;     /* where the failure kicks in */
@@ -53,7 +54,7 @@ static size_t source_read(char *buffer, size_t size, size_t nitems, void *userda
         hook();
     }
     for (i = 0; i < n; i++) {
-        buffer[i] = s->text != NULL ? s->text[s->position + i] : (char) source_byte(s->position + i);
+        buffer[i] = s->text != NULL ? s->text[s->position + i] : (char) source_byte(s->base + s->position + i);
     }
     s->position += n;
     return n;
@@ -430,6 +431,32 @@ START_TEST(test_upload_metadata)
 }
 END_TEST
 
+START_TEST(test_upload_create_final)
+{
+    const char *urls[] = {"/files/a", "http://h/files/b"};
+    const char *invalid[] = {"", "/files/a b", "/files/a\r\nX-Injected: 1", "/files/caf\xc3\xa9"};
+    vectus_upload u = (vectus_upload) &u;  /* any non-NULL value, to check create resets it */
+    size_t i;
+
+    ck_assert_int_eq(vectus_upload_create_final(&u, urls, 0), VECTUS_ERR_INVALID);
+    ck_assert_ptr_null(u);
+    for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        const char *with_invalid[] = {"/files/ok", invalid[i]};
+
+        ck_assert_msg(vectus_upload_create_final(&u, with_invalid, 2) == VECTUS_ERR_INVALID, "case %zu", i);
+        ck_assert_ptr_null(u);
+    }
+
+    ck_assert_int_eq(vectus_upload_create_final(&u, urls, 1), VECTUS_OK);
+    ck_assert_str_eq(u->final, "Upload-Concat: final;/files/a");
+    vectus_upload_cleanup(u);
+    ck_assert_int_eq(vectus_upload_create_final(&u, urls, 2), VECTUS_OK);
+    ck_assert_str_eq(u->final, "Upload-Concat: final;/files/a http://h/files/b");  /* as the spec's example */
+    ck_assert(u->length == 0);
+    vectus_upload_cleanup(u);
+}
+END_TEST
+
 START_TEST(test_upload_creates_with_data)
 {
     struct source source = {0};
@@ -737,6 +764,66 @@ START_TEST(test_upload_fake_deferred)
         if (run.code == VECTUS_OK) ck_assert(vectus_upload_offset(run.upload) == cases[i].stream);
         fake_run_cleanup(&run);
     }
+}
+END_TEST
+
+START_TEST(test_upload_fake_concatenation)
+{
+    const char *partial_responses[] = {CREATED, RESPONSE("204 No Content", "Upload-Offset: 5\r\n"), NULL};
+    const char *final_responses[] = {RESPONSE("201 Created", "Location: /files/final\r\n"), NULL};
+    const char *urls[] = {"/files/a", "/files/b"};
+    struct source source = {0};
+    struct fake_server server;
+    struct fake_run run;
+    vectus_client c;
+    vectus_upload u;
+    const char *seen;
+    char url[96];
+
+    /* A partial upload is created as one, then sent as usual */
+    fake_run_with(&run, partial_responses, &source, source_seek, 0, 5, VECTUS_EXT_CONCATENATION);
+    ck_assert_int_eq(run.code, VECTUS_OK);  /* fake_run_with marks nothing partial: check the header is opt-in */
+    ck_assert_int_eq(count(run.seen, "Upload-Concat"), 0);
+    fake_run_cleanup(&run);
+
+    memset(&source, 0, sizeof source);
+    source.text = "hello";
+    fake_server_start(&server, partial_responses);
+    c = test_client(server.url);
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
+    vectus_upload_set_partial(u);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_UNSUPPORTED);  /* no concatenation */
+    c->extensions |= VECTUS_EXT_CONCATENATION;
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
+    seen = fake_server_stop(&server);
+    ck_assert_int_eq(count(seen, "Upload-Concat: partial\r\n"), 1);
+    ck_assert_int_eq(count(seen, "Upload-Length: 5\r\n"), 1);
+    ck_assert_int_eq(count(seen, "PATCH /files/abc"), 1);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+
+    /* The final upload is only created, with its own metadata, and never sent to */
+    fake_server_start(&server, final_responses);
+    c = test_client(server.url);
+    ck_assert_int_eq(vectus_upload_create_final(&u, urls, 2), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "filename", "world_domination_plan.pdf"), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_UNSUPPORTED);
+    c->extensions |= VECTUS_EXT_CONCATENATION;
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);  /* already created: no request */
+    seen = fake_server_stop(&server);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/files/final", server.port);
+    ck_assert_str_eq(vectus_upload_url(u), url);
+    ck_assert(vectus_upload_offset(u) == 0);
+    ck_assert_int_eq(count(seen, "POST /files/ HTTP/1.1\r\n"), 1);
+    ck_assert_int_eq(count(seen, "Upload-Concat: final;/files/a /files/b\r\n"), 1);
+    ck_assert_int_eq(count(seen, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==\r\n"), 1);
+    ck_assert_int_eq(count(seen, "Upload-Length"), 0);  /* the server sums it up */
+    ck_assert_int_eq(count(seen, "Upload-Defer-Length"), 0);
+    ck_assert_int_eq(count(seen, "PATCH"), 0);
+    ck_assert_int_eq(count(seen, "HEAD"), 0);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
 }
 END_TEST
 
@@ -1111,6 +1198,43 @@ START_TEST(test_upload_live_deferred)
     ck_assert(vectus_upload_offset(u) == 4 * MIB + 7);
     assert_uploaded(vectus_upload_url(u), 4 * MIB + 7);
     vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_live_concatenation)
+{
+    struct source first = {0};
+    struct source second = {0};
+    vectus_client c = live_client("VECTUS_TEST_URL");
+    vectus_upload parts[2];
+    vectus_upload final;
+    const char *urls[2];
+
+    ck_assert(vectus_client_extensions(c) & VECTUS_EXT_CONCATENATION);
+
+    /* A small part, which rides in its creation POST, then a stream of unknown length carrying on from it */
+    ck_assert_int_eq(vectus_upload_create(&parts[0], source_read, source_seek, &first, 1000), VECTUS_OK);
+    second.base = 1000;
+    second.failure = SOURCE_ENDS_EARLY;
+    second.fail_at = 4 * MIB + 7;
+    ck_assert_int_eq(vectus_upload_create(&parts[1], source_read, source_seek, &second, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
+    vectus_upload_set_partial(parts[0]);
+    vectus_upload_set_partial(parts[1]);
+    ck_assert_int_eq(vectus_upload_perform(c, parts[0]), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, parts[1]), VECTUS_OK);
+
+    urls[0] = vectus_upload_url(parts[0]);
+    urls[1] = vectus_upload_url(parts[1]);
+    ck_assert_int_eq(vectus_upload_create_final(&final, urls, 2), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_add_metadata(final, "filename", "joined.bin"), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, final), VECTUS_OK);
+    assert_uploaded(vectus_upload_url(final), 1000 + 4 * MIB + 7);
+
+    ck_assert_int_eq(vectus_upload_terminate(c, final), VECTUS_OK);
+    vectus_upload_cleanup(final);
+    vectus_upload_cleanup(parts[0]);
+    vectus_upload_cleanup(parts[1]);
     vectus_client_cleanup(c);
 }
 END_TEST
