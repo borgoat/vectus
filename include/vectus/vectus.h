@@ -54,9 +54,29 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
  * After VECTUS_ERR_TRANSPORT or VECTUS_ERR_HTTP_STATUS, for example when the connection dropped,
  * call it again to resume where the server stopped.
  *
- * @return VECTUS_OK once the server has every byte, or why it stopped
+ * @return VECTUS_OK once the server has every byte, VECTUS_ERR_UNSUPPORTED when the upload has no URL and the server
+ *         does not offer the creation extension, or why it stopped
  */
 vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload);
+
+/**
+ * Add a key and value to the metadata sent when vectus_upload_perform creates the upload, such as its filename.
+ * Metadata added after the upload was created only reaches the server if it creates the upload again
+ *
+ * @param key printable ASCII without spaces or commas, not empty and not added before
+ * @param value any text, possibly empty; it travels Base64-encoded
+ * @return VECTUS_OK, VECTUS_ERR_INVALID for a key the protocol does not allow, or VECTUS_ERR_MEMORY
+ */
+vectus_code vectus_upload_add_metadata(vectus_upload upload, const char *key, const char *value);
+
+/**
+ * Delete the upload from the server and forget its URL, so the next vectus_upload_perform starts over.
+ * Does nothing when the upload has no URL
+ *
+ * @return VECTUS_OK, VECTUS_ERR_UNSUPPORTED when the server does not offer the termination extension,
+ *         VECTUS_ERR_GONE when the server no longer has the upload (its URL is kept), or why the request failed
+ */
+vectus_code vectus_upload_terminate(vectus_client client, vectus_upload upload);
 
 /**
  * The upload's URL on the server, NULL until vectus_upload_perform created it.

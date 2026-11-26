@@ -36,10 +36,15 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_upload, test_upload_read_wrapper);
     tcase_add_test(tc_upload, test_upload_create_and_urls);
     tcase_add_test(tc_upload, test_upload_too_large_for_server);
+    tcase_add_test(tc_upload, test_upload_base64);
+    tcase_add_test(tc_upload, test_upload_metadata);
+    tcase_add_test(tc_upload, test_upload_extensions_required);
     tcase_add_test(tc_upload, test_upload_unreachable);
     tcase_add_test(tc_upload, test_upload_stall);
     tcase_add_test(tc_upload, test_upload_fake_create_and_send);
     tcase_add_test(tc_upload, test_upload_fake_zero_length);
+    tcase_add_test(tc_upload, test_upload_fake_metadata);
+    tcase_add_test(tc_upload, test_upload_fake_terminate);
     tcase_add_test(tc_upload, test_upload_fake_create_errors);
     tcase_add_test(tc_upload, test_upload_fake_resume_errors);
     tcase_add_test(tc_upload, test_upload_fake_send_errors);

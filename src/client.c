@@ -155,6 +155,8 @@ const char *vectus_strerror(vectus_code code) {
     case VECTUS_ERR_TOO_LARGE: return "the upload is too large";
     case VECTUS_ERR_GONE: return "the upload no longer exists on the server";
     case VECTUS_ERR_SOURCE: return "the data to upload could not be read";
+    case VECTUS_ERR_UNSUPPORTED: return "the server does not offer the tus extension this needs";
+    case VECTUS_ERR_INVALID: return "invalid argument";
     }
     return "unknown error";
 }
