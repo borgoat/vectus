@@ -73,6 +73,14 @@ unsigned int vectus_client_extensions(vectus_client client);
 unsigned long long vectus_client_max_size(vectus_client client);
 
 /**
+ * Send PATCH and DELETE requests as POST with an X-HTTP-Method-Override header naming the real method,
+ * for proxies or firewalls that block those methods. Off by default
+ *
+ * @param enabled non-zero to turn it on
+ */
+void vectus_client_set_method_override(vectus_client client, int enabled);
+
+/**
  * Free up a vectus_client instance
  *
  * @param client the vectus_client to cleanup, or NULL to do nothing
