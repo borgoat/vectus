@@ -139,6 +139,30 @@ static struct curl_slist *upload_add_header(struct curl_slist *headers, const ch
     return appended;
 }
 
+/* shortcut: only uploads up to 1 MiB ride in the creation POST, since bytes sent before the server answers with the URL
+   cannot be resumed; make it a client setting when callers need another limit */
+#define UPLOAD_CREATION_DATA_MAX (1024ULL * 1024ULL)
+
+/**
+ * Whether the creation POST carries the whole upload, as the creation-with-upload extension allows
+ */
+static int upload_creates_with_data(vectus_client client, vectus_upload upload) {
+    return (client->extensions & VECTUS_EXT_CREATION_WITH_UPLOAD) && upload->length > 0 && upload->length <= UPLOAD_CREATION_DATA_MAX;
+}
+
+/**
+ * Move the byte stream to the offset the server has, before sending from there
+ */
+static vectus_code upload_seek(vectus_upload upload) {
+    if (upload->position != upload->offset) {
+        if (upload->seek_callback == NULL || upload->seek_callback(upload->userdata, upload->offset) != 0) {
+            return VECTUS_ERR_SOURCE;
+        }
+        upload->position = upload->offset;
+    }
+    return VECTUS_OK;
+}
+
 /**
  * Send one tus request about the upload and collect what the response says
  *
@@ -150,6 +174,7 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
     struct curl_slist *headers = NULL;
     char header[64];
     int failed = 0;
+    int with_data = method == UPLOAD_PATCH || (method == UPLOAD_POST && upload_creates_with_data(client, upload));
     vectus_code code = VECTUS_ERR_MEMORY;
 
     if (c == NULL) {
@@ -160,13 +185,17 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
     if (method == UPLOAD_POST) {
         snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
         headers = upload_add_header(headers, header, &failed);
-        headers = upload_add_header(headers, "Content-Type:", &failed);  /* drop the form type curl gives a POST */
         if (upload->metadata != NULL) headers = upload_add_header(headers, upload->metadata, &failed);
     } else if (method == UPLOAD_PATCH) {
         snprintf(header, sizeof header, "Upload-Offset: %llu", upload->offset);
         headers = upload_add_header(headers, header, &failed);
+    }
+    if (with_data) {
         headers = upload_add_header(headers, "Content-Type: application/offset+octet-stream", &failed);
-        headers = upload_add_header(headers, "Expect:", &failed);  /* send the body at once instead of waiting for 100 Continue */
+        /* A creation POST lets the server refuse before the data goes out, as the spec asks; a PATCH sends it at once */
+        headers = upload_add_header(headers, method == UPLOAD_POST ? "Expect: 100-continue" : "Expect:", &failed);
+    } else if (method == UPLOAD_POST) {
+        headers = upload_add_header(headers, "Content-Type:", &failed);  /* drop the form type curl gives a POST */
     }
     if (failed) {
         goto done;
@@ -181,7 +210,12 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
     curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, client->stall_timeout);
     switch (method) {
     case UPLOAD_POST:
-        curl_easy_setopt(c, CURLOPT_POSTFIELDS, "");
+        if (with_data) {
+            curl_easy_setopt(c, CURLOPT_POST, 1L);
+            curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) upload->length);
+        } else {
+            curl_easy_setopt(c, CURLOPT_POSTFIELDS, "");
+        }
         break;
     case UPLOAD_HEAD:
         curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
@@ -189,13 +223,15 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
     case UPLOAD_PATCH:
         curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PATCH");
-        curl_easy_setopt(c, CURLOPT_READFUNCTION, upload_read_callback);
-        curl_easy_setopt(c, CURLOPT_READDATA, (void *) upload);
         curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t) (upload->length - upload->offset));
         break;
     case UPLOAD_DELETE:
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
         break;
+    }
+    if (with_data) {
+        curl_easy_setopt(c, CURLOPT_READFUNCTION, upload_read_callback);
+        curl_easy_setopt(c, CURLOPT_READDATA, (void *) upload);
     }
 
     upload->source_failed = 0;
@@ -241,12 +277,16 @@ static int upload_gone(long status) {
 }
 
 /**
- * Create the upload on the server, keeping the URL it answers in Location
+ * Create the upload on the server, keeping the URL it answers in Location, and send the data along when it may
  */
 static vectus_code upload_create_remote(vectus_client client, vectus_upload upload) {
     struct upload_response response = {0};
-    vectus_code code = upload_request(client, upload, UPLOAD_POST, client->url, &response);
+    int with_data = upload_creates_with_data(client, upload);
+    vectus_code code = with_data ? upload_seek(upload) : VECTUS_OK;  /* back to the start after an earlier attempt */
 
+    if (code == VECTUS_OK) {
+        code = upload_request(client, upload, UPLOAD_POST, client->url, &response);
+    }
     if (code != VECTUS_OK) {
         /* keep the code */
     } else if (response.status == 413) {  /* the server's own limit, when it did not advertise Tus-Max-Size */
@@ -259,7 +299,13 @@ static vectus_code upload_create_remote(vectus_client client, vectus_upload uplo
         upload->url = upload_resolve_url(client->url, response.location);
         upload->offset = 0;
         upload->expires = response.expires;
-        if (upload->url == NULL) code = VECTUS_ERR_PROTOCOL;
+        if (upload->url == NULL) {
+            code = VECTUS_ERR_PROTOCOL;
+        } else if (with_data && (!response.has_offset || response.offset > upload->length)) {
+            code = VECTUS_ERR_PROTOCOL;  /* the URL stays, so the next perform asks the server what it kept */
+        } else if (with_data) {
+            upload->offset = response.offset;
+        }
     }
     free(response.location);
     return code;
@@ -294,13 +340,10 @@ static vectus_code upload_fetch_offset(vectus_client client, vectus_upload uploa
  */
 static vectus_code upload_send(vectus_client client, vectus_upload upload) {
     struct upload_response response = {0};
-    vectus_code code;
+    vectus_code code = upload_seek(upload);
 
-    if (upload->position != upload->offset) {
-        if (upload->seek_callback == NULL || upload->seek_callback(upload->userdata, upload->offset) != 0) {
-            return VECTUS_ERR_SOURCE;
-        }
-        upload->position = upload->offset;
+    if (code != VECTUS_OK) {
+        return code;
     }
 
     code = upload_request(client, upload, UPLOAD_PATCH, upload->url, &response);
