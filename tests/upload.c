@@ -71,6 +71,7 @@ static vectus_client test_client(const char *url) {
     c->url = malloc(strlen(url) + 1);
     strcpy(c->url, url);
     c->stall_timeout = 5;
+    c->extensions = VECTUS_EXT_CREATION | VECTUS_EXT_TERMINATION;  /* as tusd offers by default */
     return c;
 }
 
@@ -336,6 +337,70 @@ START_TEST(test_upload_too_large_for_server)
 }
 END_TEST
 
+START_TEST(test_upload_base64)
+{
+    /* RFC 4648's test vectors */
+    const char *cases[][2] = {
+        {"", ""}, {"f", "Zg=="}, {"fo", "Zm8="}, {"foo", "Zm9v"}, {"foob", "Zm9vYg=="}, {"fooba", "Zm9vYmE="}, {"foobar", "Zm9vYmFy"},
+    };
+    char out[16];
+    size_t i;
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        upload_base64((const unsigned char *) cases[i][0], strlen(cases[i][0]), out);
+        ck_assert_str_eq(out, cases[i][1]);
+    }
+    upload_base64((const unsigned char *) "\xff\xfe\x00", 3, out);  /* high bits and a NUL */
+    ck_assert_str_eq(out, "//4A");
+}
+END_TEST
+
+START_TEST(test_upload_metadata)
+{
+    /* The last two are already added: one followed by a value, one by the end */
+    const char *invalid[] = {"", "file name", "a,b", "a\r\nX-Injected: 1", "caf\xc3\xa9", "filename", "is_confidential"};
+    struct source source = {0};
+    vectus_upload u;
+    size_t i;
+
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
+    ck_assert_ptr_null(u->metadata);
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "filename", "world_domination_plan.pdf"), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "is_confidential", ""), VECTUS_OK);
+    ck_assert_str_eq(u->metadata, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential");  /* the spec's example */
+
+    for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        ck_assert_msg(vectus_upload_add_metadata(u, invalid[i], "x") == VECTUS_ERR_INVALID, "case %zu", i);
+    }
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "file", "x"), VECTUS_OK);  /* a prefix of a key is another key */
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "is_confidential", "x"), VECTUS_ERR_INVALID);  /* now followed by a comma */
+    ck_assert_str_eq(u->metadata, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential,file eA==");
+    vectus_upload_cleanup(u);
+}
+END_TEST
+
+START_TEST(test_upload_extensions_required)
+{
+    struct source source = {0};
+    vectus_client c = test_client("http://127.0.0.1:1/files/");  /* any request would fail with VECTUS_ERR_TRANSPORT */
+    vectus_upload u;
+
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_OK);  /* no URL, nothing to delete */
+
+    c->extensions = VECTUS_EXT_TERMINATION;
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_UNSUPPORTED);
+    ck_assert_ptr_null(vectus_upload_url(u));
+
+    c->extensions = VECTUS_EXT_CREATION;
+    ck_assert_int_eq(vectus_upload_set_url(u, "http://127.0.0.1:1/files/abc"), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_ERR_UNSUPPORTED);
+    ck_assert_str_eq(vectus_upload_url(u), "http://127.0.0.1:1/files/abc");
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
 START_TEST(test_upload_unreachable)
 {
     struct source source = {0};
@@ -429,6 +494,74 @@ START_TEST(test_upload_fake_zero_length)
     ck_assert_int_eq(source.reads, 0);
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_fake_metadata)
+{
+    const char *responses[] = {CREATED, RESPONSE("204 No Content", "Upload-Offset: 5\r\n"), NULL};
+    struct source source = {0};
+    vectus_upload u;
+    struct fake_server server;
+    vectus_client c;
+    const char *seen;
+
+    source.text = "hello";
+    fake_server_start(&server, responses);
+    c = test_client(server.url);
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "filename", "world_domination_plan.pdf"), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_add_metadata(u, "is_confidential", ""), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
+    seen = fake_server_stop(&server);
+
+    /* Once, on the POST before the PATCH */
+    ck_assert_int_eq(count(seen, "\r\nUpload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential\r\n"), 1);
+    ck_assert_int_eq(count(seen, "Upload-Metadata"), 1);
+    ck_assert(strstr(seen, "Upload-Metadata") < strstr(seen, "PATCH"));
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_fake_terminate)
+{
+    const struct expectation cases[] = {
+        {RESPONSE("204 No Content", ""), VECTUS_OK},
+        {RESPONSE("404 Not Found", ""), VECTUS_ERR_GONE},
+        {RESPONSE("500 Internal Server Error", ""), VECTUS_ERR_HTTP_STATUS},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const char *responses[] = {cases[i].response, NULL};
+        struct source source = {0};
+        struct fake_server server;
+        vectus_client c;
+        vectus_upload u;
+        vectus_code code;
+        const char *seen;
+        char url[96];
+
+        fake_server_start(&server, responses);
+        c = test_client(server.url);
+        snprintf(url, sizeof url, "http://127.0.0.1:%d/files/abc", server.port);
+        ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
+        ck_assert_int_eq(vectus_upload_set_url(u, url), VECTUS_OK);
+        code = vectus_upload_terminate(c, u);
+        seen = fake_server_stop(&server);
+
+        ck_assert_msg(code == cases[i].code, "case %zu: %s", i, vectus_strerror(code));
+        ck_assert_int_eq(count(seen, "DELETE /files/abc HTTP/1.1\r\n"), 1);
+        ck_assert_int_eq(count(seen, "Tus-Resumable: 1.0.0\r\n"), 1);
+        if (code == VECTUS_OK) {
+            ck_assert_ptr_null(vectus_upload_url(u));  /* forgotten, so the next perform starts over */
+        } else {
+            ck_assert_str_eq(vectus_upload_url(u), url);
+        }
+        vectus_upload_cleanup(u);
+        vectus_client_cleanup(c);
+    }
 }
 END_TEST
 
@@ -744,11 +877,16 @@ START_TEST(test_upload_live_gone)
     struct source source = {0};
     vectus_client c = live_client("VECTUS_TEST_URL");
     vectus_upload u = live_upload(c, &source, 1000);
+    char terminated[512];
     char missing[512];
 
-    /* Terminated through the termination extension */
-    ck_assert_int_eq(http("DELETE", vectus_upload_url(u), NULL, NULL), 204);
+    /* Terminated through the termination extension, which forgets the URL */
+    snprintf(terminated, sizeof terminated, "%s", vectus_upload_url(u));
+    ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_OK);
+    ck_assert_ptr_null(vectus_upload_url(u));
+    ck_assert_int_eq(vectus_upload_set_url(u, terminated), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_GONE);
+    ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_ERR_GONE);
 
     /* Never existed */
     snprintf(missing, sizeof missing, "%sdoes-not-exist", getenv("VECTUS_TEST_URL"));

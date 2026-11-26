@@ -51,6 +51,11 @@ struct vectus_upload_s {
     char *url;
 
     /**
+     * the whole Upload-Metadata header line sent on creation, NULL until a pair is added
+     */
+    char *metadata;
+
+    /**
      * set when the read callback aborted or ended early during the current request
      */
     int source_failed;
@@ -68,7 +73,7 @@ struct upload_response {
     unsigned long long length;
 };
 
-enum upload_method { UPLOAD_POST, UPLOAD_HEAD, UPLOAD_PATCH };
+enum upload_method { UPLOAD_POST, UPLOAD_HEAD, UPLOAD_PATCH, UPLOAD_DELETE };
 
 static void upload_handle_header(void *target, const char *name, char *value) {
     struct upload_response *response = target;
@@ -146,6 +151,7 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
         snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
         headers = upload_add_header(headers, header, &failed);
         headers = upload_add_header(headers, "Content-Type:", &failed);  /* drop the form type curl gives a POST */
+        if (upload->metadata != NULL) headers = upload_add_header(headers, upload->metadata, &failed);
     } else if (method == UPLOAD_PATCH) {
         snprintf(header, sizeof header, "Upload-Offset: %llu", upload->offset);
         headers = upload_add_header(headers, header, &failed);
@@ -175,6 +181,9 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
         curl_easy_setopt(c, CURLOPT_READFUNCTION, upload_read_callback);
         curl_easy_setopt(c, CURLOPT_READDATA, (void *) upload);
         curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t) (upload->length - upload->offset));
+        break;
+    case UPLOAD_DELETE:
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
         break;
     }
 
@@ -319,6 +328,9 @@ vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload) {
     vectus_code code;
 
     if (upload->url == NULL) {
+        if (!(client->extensions & VECTUS_EXT_CREATION)) {
+            return VECTUS_ERR_UNSUPPORTED;
+        }
         if (client->max_size != 0 && upload->length > client->max_size) {
             return VECTUS_ERR_TOO_LARGE;
         }
@@ -357,10 +369,100 @@ unsigned long long vectus_upload_offset(vectus_upload upload) {
     return upload->offset;
 }
 
+/**
+ * Base64-encode len bytes of in, padded as in RFC 4648, into out, which needs room for (len + 2) / 3 * 4 + 1 bytes
+ */
+static void upload_base64(const unsigned char *in, size_t len, char *out) {
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i;
+
+    for (i = 0; i < len; i += 3) {
+        unsigned long bits = (unsigned long) in[i] << 16;
+
+        if (i + 1 < len) bits |= (unsigned long) in[i + 1] << 8;
+        if (i + 2 < len) bits |= in[i + 2];
+        *out++ = alphabet[bits >> 18];
+        *out++ = alphabet[(bits >> 12) & 63];
+        *out++ = i + 1 < len ? alphabet[(bits >> 6) & 63] : '=';
+        *out++ = i + 2 < len ? alphabet[bits & 63] : '=';
+    }
+    *out = '\0';
+}
+
+vectus_code vectus_upload_add_metadata(vectus_upload upload, const char *key, const char *value) {
+    static const char prefix[] = "Upload-Metadata: ";
+    size_t key_len = strlen(key);
+    size_t value_len = strlen(value);
+    size_t used = upload->metadata != NULL ? strlen(upload->metadata) : 0;
+    const char *pair = upload->metadata != NULL ? upload->metadata + sizeof prefix - 1 : NULL;
+    size_t size;
+    char *grown;
+    char *end;
+    size_t i;
+
+    /* The key goes into the header as it is, where spaces and commas separate the pairs */
+    if (key_len == 0) {
+        return VECTUS_ERR_INVALID;
+    }
+    for (i = 0; i < key_len; i++) {
+        unsigned char ch = (unsigned char) key[i];
+
+        if (ch <= ' ' || ch > '~' || ch == ',') return VECTUS_ERR_INVALID;
+    }
+    while (pair != NULL) {
+        if (strncmp(pair, key, key_len) == 0 && (pair[key_len] == ' ' || pair[key_len] == ',' || pair[key_len] == '\0')) {
+            return VECTUS_ERR_INVALID;  /* keys must be unique */
+        }
+        pair = strchr(pair, ',');
+        if (pair != NULL) pair++;
+    }
+
+    /* The prefix before the first pair and a comma before the others, then the key, a space and the Base64 value */
+    size = (used == 0 ? sizeof prefix : used + 2) + key_len + 1 + (value_len + 2) / 3 * 4;
+    grown = realloc(upload->metadata, size);
+    if (grown == NULL) {
+        return VECTUS_ERR_MEMORY;
+    }
+    upload->metadata = grown;
+    end = grown + used;
+    end += snprintf(end, size - used, "%s%s", used == 0 ? prefix : ",", key);
+    if (value_len > 0) {  /* an empty value may leave out the space too */
+        *end++ = ' ';
+        upload_base64((const unsigned char *) value, value_len, end);
+    }
+    return VECTUS_OK;
+}
+
+vectus_code vectus_upload_terminate(vectus_client client, vectus_upload upload) {
+    struct upload_response response = {0};
+    vectus_code code;
+
+    if (upload->url == NULL) {
+        return VECTUS_OK;
+    }
+    if (!(client->extensions & VECTUS_EXT_TERMINATION)) {
+        return VECTUS_ERR_UNSUPPORTED;
+    }
+
+    code = upload_request(client, upload, UPLOAD_DELETE, upload->url, &response);
+    if (code != VECTUS_OK) {
+        /* keep the code */
+    } else if (upload_gone(response.status)) {
+        code = VECTUS_ERR_GONE;
+    } else if (response.status != 204) {
+        code = VECTUS_ERR_HTTP_STATUS;
+    } else {
+        vectus_upload_set_url(upload, NULL);  /* cannot fail with NULL */
+    }
+    free(response.location);
+    return code;
+}
+
 void vectus_upload_cleanup(vectus_upload upload) {
     if (upload == NULL) {
         return;
     }
     free(upload->url);
+    free(upload->metadata);
     free(upload);
 }
