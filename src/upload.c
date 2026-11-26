@@ -51,6 +51,11 @@ struct vectus_upload_s {
     char *url;
 
     /**
+     * when the server will remove the unfinished upload, 0 if unknown
+     */
+    time_t expires;
+
+    /**
      * the whole Upload-Metadata header line sent on creation, NULL until a pair is added
      */
     char *metadata;
@@ -71,6 +76,7 @@ struct upload_response {
     unsigned long long offset;
     int has_length;
     unsigned long long length;
+    time_t expires;  /* 0 when absent or not a date */
 };
 
 enum upload_method { UPLOAD_POST, UPLOAD_HEAD, UPLOAD_PATCH, UPLOAD_DELETE };
@@ -86,6 +92,10 @@ static void upload_handle_header(void *target, const char *name, char *value) {
         response->has_offset = vectus_parse_size(value, &response->offset);
     } else if (curl_strequal(name, "Upload-Length")) {
         response->has_length = vectus_parse_size(value, &response->length);
+    } else if (curl_strequal(name, "Upload-Expires")) {
+        time_t expires = curl_getdate(value, NULL);  /* -1 when it is not a date */
+
+        if (expires > 0) response->expires = expires;
     }
 }
 
@@ -248,6 +258,7 @@ static vectus_code upload_create_remote(vectus_client client, vectus_upload uplo
     } else {
         upload->url = upload_resolve_url(client->url, response.location);
         upload->offset = 0;
+        upload->expires = response.expires;
         if (upload->url == NULL) code = VECTUS_ERR_PROTOCOL;
     }
     free(response.location);
@@ -272,6 +283,7 @@ static vectus_code upload_fetch_offset(vectus_client client, vectus_upload uploa
         code = VECTUS_ERR_PROTOCOL;
     } else {
         upload->offset = response.offset;
+        if (response.expires != 0) upload->expires = response.expires;  /* servers need only send it on POST and PATCH */
     }
     free(response.location);
     return code;
@@ -302,6 +314,7 @@ static vectus_code upload_send(vectus_client client, vectus_upload upload) {
         code = VECTUS_ERR_PROTOCOL;  /* an offset that does not move forward would loop forever */
     } else {
         upload->offset = response.offset;
+        if (response.expires != 0) upload->expires = response.expires;  /* a finished upload may no longer expire */
     }
     free(response.location);
     return code;
@@ -363,11 +376,16 @@ vectus_code vectus_upload_set_url(vectus_upload upload, const char *url) {
     free(upload->url);
     upload->url = copy;
     upload->offset = 0;  /* unknown until perform asks the server */
+    upload->expires = 0;
     return VECTUS_OK;
 }
 
 unsigned long long vectus_upload_offset(vectus_upload upload) {
     return upload->offset;
+}
+
+time_t vectus_upload_expires(vectus_upload upload) {
+    return upload->expires;
 }
 
 /**
