@@ -36,6 +36,11 @@ struct vectus_client_s {
      * seconds without a byte moving before a request gives up, so an upload can resume instead of hanging
      */
     long stall_timeout;
+
+    /**
+     * set to send PATCH and DELETE as POST with X-HTTP-Method-Override
+     */
+    int method_override;
 };
 
 /* shortcut: every client gets this stall timeout; add a setter when callers need another */

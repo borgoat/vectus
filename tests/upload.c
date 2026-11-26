@@ -807,6 +807,7 @@ START_TEST(test_upload_fake_concatenation)
     c = test_client(server.url);
     ck_assert_int_eq(vectus_upload_create_final(&u, urls, 2), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_add_metadata(u, "filename", "world_domination_plan.pdf"), VECTUS_OK);
+    vectus_upload_set_partial(u);  /* a mistake, which must not make it both */
     ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_UNSUPPORTED);
     c->extensions |= VECTUS_EXT_CONCATENATION;
     ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
@@ -817,11 +818,44 @@ START_TEST(test_upload_fake_concatenation)
     ck_assert(vectus_upload_offset(u) == 0);
     ck_assert_int_eq(count(seen, "POST /files/ HTTP/1.1\r\n"), 1);
     ck_assert_int_eq(count(seen, "Upload-Concat: final;/files/a /files/b\r\n"), 1);
+    ck_assert_int_eq(count(seen, "Upload-Concat"), 1);
     ck_assert_int_eq(count(seen, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==\r\n"), 1);
     ck_assert_int_eq(count(seen, "Upload-Length"), 0);  /* the server sums it up */
     ck_assert_int_eq(count(seen, "Upload-Defer-Length"), 0);
     ck_assert_int_eq(count(seen, "PATCH"), 0);
     ck_assert_int_eq(count(seen, "HEAD"), 0);
+    vectus_upload_cleanup(u);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_fake_method_override)
+{
+    const char *responses[] = {CREATED, RESPONSE("204 No Content", "Upload-Offset: 5\r\n"), RESPONSE("204 No Content", ""), NULL};
+    struct source source = {0};
+    struct fake_server server;
+    vectus_client c;
+    vectus_upload u;
+    const char *seen;
+
+    source.text = "hello";
+    fake_server_start(&server, responses);
+    c = test_client(server.url);
+    ck_assert_int_eq(c->method_override, 0);  /* off by default */
+    vectus_client_set_method_override(c, 2);
+    ck_assert_int_eq(c->method_override, 1);
+    ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);
+    ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_OK);
+    seen = fake_server_stop(&server);
+
+    ck_assert_int_eq(count(seen, "POST /files/abc HTTP/1.1\r\n"), 2);
+    ck_assert_int_eq(count(seen, "X-HTTP-Method-Override: PATCH\r\n"), 1);
+    ck_assert_int_eq(count(seen, "X-HTTP-Method-Override: DELETE\r\n"), 1);
+    ck_assert_int_eq(count(seen, "PATCH /"), 0);
+    ck_assert_int_eq(count(seen, "DELETE /"), 0);
+    ck_assert_int_eq(count(seen, "Upload-Offset: 0\r\n"), 1);
+    ck_assert_int_eq(count(seen, "\r\n\r\nhello"), 1);
     vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
 }
@@ -1235,6 +1269,21 @@ START_TEST(test_upload_live_concatenation)
     vectus_upload_cleanup(final);
     vectus_upload_cleanup(parts[0]);
     vectus_upload_cleanup(parts[1]);
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_upload_live_method_override)
+{
+    struct source source = {0};
+    vectus_client c = live_client("VECTUS_TEST_URL");
+    vectus_upload u;
+
+    vectus_client_set_method_override(c, 1);
+    u = live_upload(c, &source, 2 * MIB);  /* over the creation-with-upload limit, so it takes a PATCH */
+    assert_uploaded(vectus_upload_url(u), 2 * MIB);
+    ck_assert_int_eq(vectus_upload_terminate(c, u), VECTUS_OK);  /* a DELETE */
+    vectus_upload_cleanup(u);
     vectus_client_cleanup(c);
 }
 END_TEST

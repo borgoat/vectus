@@ -229,6 +229,10 @@ unsigned long long vectus_client_max_size(vectus_client client) {
     return client != NULL ? client->max_size : 0;
 }
 
+void vectus_client_set_method_override(vectus_client client, int enabled) {
+    client->method_override = enabled != 0;
+}
+
 void vectus_client_cleanup(vectus_client client) {
     if (client == NULL) {
         return;

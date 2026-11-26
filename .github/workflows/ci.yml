@@ -53,7 +53,7 @@ jobs:
           ctest --test-dir build --output-on-failure --verbose | tee ctest.log
           # ctest passes the same when live tests are skipped, so check each one really ran
           for test in test_vectus_client_init test_upload_live test_upload_live_small test_upload_live_deferred \
-                      test_upload_live_concatenation \
+                      test_upload_live_concatenation test_upload_live_method_override \
                       test_upload_live_empty test_upload_live_resume \
                       test_upload_live_length_mismatch test_upload_live_gone test_upload_live_too_large \
                       test_resume_after_cut test_resume_deferred_after_cut test_resume_after_stall test_resume_repeatedly; do

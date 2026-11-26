@@ -225,7 +225,7 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
             snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
             headers = upload_add_header(headers, header, &failed);
         }
-        if (upload->partial) headers = upload_add_header(headers, "Upload-Concat: partial", &failed);
+        if (upload->partial && upload->final == NULL) headers = upload_add_header(headers, "Upload-Concat: partial", &failed);
         if (upload->metadata != NULL) headers = upload_add_header(headers, upload->metadata, &failed);
     } else if (method == UPLOAD_PATCH) {
         snprintf(header, sizeof header, "Upload-Offset: %llu", upload->offset);
@@ -234,6 +234,11 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
             snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
             headers = upload_add_header(headers, header, &failed);
         }
+    }
+    if (client->method_override && method == UPLOAD_PATCH) {
+        headers = upload_add_header(headers, "X-HTTP-Method-Override: PATCH", &failed);
+    } else if (client->method_override && method == UPLOAD_DELETE) {
+        headers = upload_add_header(headers, "X-HTTP-Method-Override: DELETE", &failed);
     }
     if (with_data) {
         headers = upload_add_header(headers, "Content-Type: application/offset+octet-stream", &failed);
@@ -267,13 +272,13 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
         break;
     case UPLOAD_PATCH:
         curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
-        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PATCH");
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, client->method_override ? "POST" : "PATCH");
         if (upload->length != VECTUS_LENGTH_UNKNOWN) {  /* otherwise curl sends the stream chunked */
             curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t) (upload->length - upload->offset));
         }
         break;
     case UPLOAD_DELETE:
-        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "DELETE");
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, client->method_override ? "POST" : "DELETE");
         break;
     }
     if (with_data) {
