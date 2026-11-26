@@ -53,6 +53,11 @@ struct vectus_client_s {
 size_t vectus_parse_header_line(const char *buffer, size_t bytes, void (*handle)(void *target, const char *name, char *value), void *target);
 
 /**
+ * A curl write callback that drops the response body, which curl would otherwise print to the application's stdout
+ */
+size_t vectus_discard_body(char *buffer, size_t size, size_t nitems, void *userdata);
+
+/**
  * Parse a header value made only of digits, such as Tus-Max-Size
  *
  * @return 1 with the value stored in size, or 0 leaving size alone for anything else, including a sign or a value too large
