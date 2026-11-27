@@ -1,8 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L  /* fstat and fseeko, for files over 2 GiB */
+#endif
+#define _FILE_OFFSET_BITS 64  /* the same on 32-bit systems */
+
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <curl/curl.h>
 #include <vectus/vectus.h>
@@ -81,9 +88,40 @@ struct vectus_upload_s {
     char *final;
 
     /**
-     * set when the read callback aborted or ended early during the current request
+     * what went wrong with the read callback during the current request, NULL if nothing did
      */
-    int source_failed;
+    const char *source_failed;
+
+    /**
+     * called as the data goes out, NULL for none
+     */
+    vectus_progress_callback progress;
+    void *progress_userdata;
+
+    /**
+     * set when the progress callback stopped the current request
+     */
+    int cancelled;
+
+    /**
+     * the file vectus_upload_create_file opened, closed on cleanup
+     */
+    FILE *file;
+
+    /**
+     * reused for every request, so they can share a connection
+     */
+    CURL *curl;
+
+    /**
+     * the HTTP status of the last response, 0 if none came
+     */
+    long status;
+
+    /**
+     * why the last perform or terminate failed, empty after one succeeded
+     */
+    char error[VECTUS_ERROR_SIZE];
 };
 
 /**
@@ -98,6 +136,7 @@ struct upload_response {
     unsigned long long length;
     int length_deferred;  /* Upload-Defer-Length: 1, the server still waits for the length */
     time_t expires;  /* 0 when absent or not a date */
+    int out_of_memory;  /* storing Location failed */
 };
 
 enum upload_method { UPLOAD_POST, UPLOAD_HEAD, UPLOAD_PATCH, UPLOAD_DELETE };
@@ -109,6 +148,7 @@ static void upload_handle_header(void *target, const char *name, char *value) {
         free(response->location);
         response->location = malloc(strlen(value) + 1);
         if (response->location != NULL) strcpy(response->location, value);
+        else response->out_of_memory = 1;
     } else if (curl_strequal(name, "Upload-Offset")) {
         response->has_offset = vectus_parse_size(value, &response->offset);
     } else if (curl_strequal(name, "Upload-Length")) {
@@ -140,17 +180,51 @@ static size_t upload_read_callback(char *buffer, size_t size, size_t nitems, voi
         return 0;
     }
 
-    bytes = upload->read_callback(buffer, 1, wanted, upload->userdata);
+    bytes = upload->read_callback(upload->userdata, buffer, wanted);
     if (bytes == 0 && upload->length == VECTUS_LENGTH_UNKNOWN) {
         upload->length = upload->position;  /* the end of a stream announced without a length */
         return 0;
     }
-    if (bytes == 0 || bytes > wanted) {  /* VECTUS_READ_ABORT, the data ending before length, or a broken callback */
-        upload->source_failed = 1;
+    if (bytes == VECTUS_READ_ABORT) {
+        upload->source_failed = "the read callback aborted";
+    } else if (bytes == 0) {
+        upload->source_failed = "the data ended before the upload's length";
+    } else if (bytes > wanted) {
+        upload->source_failed = "the read callback returned more than asked for";
+    }
+    if (upload->source_failed != NULL) {
         return CURL_READFUNC_ABORT;
     }
     upload->position += bytes;
     return bytes;
+}
+
+/**
+ * Report to the progress callback how far the data has gone, from where the server stood when the request started
+ */
+static int upload_progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+    vectus_upload upload = clientp;
+    unsigned long long sent = upload->offset + (unsigned long long) ulnow;
+
+    (void) dltotal;
+    (void) dlnow;
+    (void) ultotal;  /* 0 while sending a stream of unknown length, so the upload's own length says more */
+    if (ulnow > 0 && sent > upload->position) {
+        sent = upload->position;  /* ulnow counts the chunked encoding's framing too, but no more went than was read */
+    }
+    if (upload->progress(upload->progress_userdata, sent, upload->length) != 0) {
+        upload->cancelled = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Note why the upload stopped, for vectus_upload_error
+ */
+static vectus_code upload_fail(vectus_upload upload, vectus_code code, const char *message) {
+    snprintf(upload->error, sizeof upload->error, "%s", message);
+    return code;
 }
 
 /**
@@ -190,11 +264,27 @@ static int upload_declares_length(vectus_upload upload) {
 static vectus_code upload_seek(vectus_upload upload) {
     if (upload->position != upload->offset) {
         if (upload->seek_callback == NULL || upload->seek_callback(upload->userdata, upload->offset) != 0) {
+            snprintf(upload->error, sizeof upload->error, "could not seek the data to byte %llu%s", upload->offset,
+                     upload->seek_callback == NULL ? ": the upload has no seek callback" : "");
             return VECTUS_ERR_SOURCE;
         }
         upload->position = upload->offset;
     }
     return VECTUS_OK;
+}
+
+/**
+ * The upload's curl handle, cleared of the last request's options but keeping its connection open for the next one
+ *
+ * @return the handle, or NULL out of memory, with the error naming method
+ */
+static CURL *upload_handle(vectus_upload upload, const char *method) {
+    if (upload->curl != NULL) {
+        curl_easy_reset(upload->curl);
+    } else if ((upload->curl = curl_easy_init()) == NULL) {
+        snprintf(upload->error, sizeof upload->error, "%s: out of memory", method);
+    }
+    return upload->curl;
 }
 
 /**
@@ -204,13 +294,15 @@ static vectus_code upload_seek(vectus_upload upload) {
  */
 static vectus_code upload_request(vectus_client client, vectus_upload upload, enum upload_method method, const char *url,
                                   struct upload_response *response) {
-    CURL *c = curl_easy_init();
+    static const char *const names[] = {"POST", "HEAD", "PATCH", "DELETE"};
+    CURL *c;
     struct curl_slist *headers = NULL;
     char header[64];
     int failed = 0;
     int with_data = method == UPLOAD_PATCH || (method == UPLOAD_POST && upload_creates_with_data(client, upload));
     vectus_code code = VECTUS_ERR_MEMORY;
 
+    c = upload_handle(upload, names[method]);
     if (c == NULL) {
         return VECTUS_ERR_MEMORY;
     }
@@ -248,16 +340,13 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
         headers = upload_add_header(headers, "Content-Type:", &failed);  /* drop the form type curl gives a POST */
     }
     if (failed) {
+        snprintf(upload->error, sizeof upload->error, "%s: out of memory", names[method]);
         goto done;
     }
 
     curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, upload_header_callback);
     curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) response);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, vectus_discard_body);
-    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);  /* give up on a stalled connection, so the upload can resume */
-    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, client->stall_timeout);
     switch (method) {
     case UPLOAD_POST:
         if (with_data) {
@@ -285,18 +374,29 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
         curl_easy_setopt(c, CURLOPT_READFUNCTION, upload_read_callback);
         curl_easy_setopt(c, CURLOPT_READDATA, (void *) upload);
     }
+    if (upload->progress != NULL) {
+        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, upload_progress_callback);
+        curl_easy_setopt(c, CURLOPT_XFERINFODATA, (void *) upload);
+    }
 
-    upload->source_failed = 0;
-    if (curl_easy_perform(c) != CURLE_OK) {
-        code = upload->source_failed ? VECTUS_ERR_SOURCE : VECTUS_ERR_TRANSPORT;
-    } else {
-        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &response->status);
-        code = VECTUS_OK;
+    upload->source_failed = NULL;
+    upload->cancelled = 0;
+    code = vectus_request(client, c, names[method], &headers, upload->error, &upload->status);
+    response->status = upload->status;
+    if (code == VECTUS_OK && response->out_of_memory) {
+        snprintf(upload->error, sizeof upload->error, "%s: out of memory", names[method]);
+        code = VECTUS_ERR_MEMORY;
+    } else if (code != VECTUS_OK && upload->cancelled) {
+        snprintf(upload->error, sizeof upload->error, "%s: cancelled by the progress callback", names[method]);
+        code = VECTUS_ERR_CANCELLED;
+    } else if (code != VECTUS_OK && upload->source_failed != NULL) {
+        snprintf(upload->error, sizeof upload->error, "%s, at byte %llu", upload->source_failed, upload->position);
+        code = VECTUS_ERR_SOURCE;
     }
 
 done:
     curl_slist_free_all(headers);
-    curl_easy_cleanup(c);
     return code;
 }
 
@@ -346,16 +446,17 @@ static vectus_code upload_create_remote(vectus_client client, vectus_upload uplo
     } else if (response.status != 201) {
         code = VECTUS_ERR_HTTP_STATUS;
     } else if (response.location == NULL) {
-        code = VECTUS_ERR_PROTOCOL;
+        code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "POST answered 201 without a Location header");
     } else {
         upload->url = upload_resolve_url(client->url, response.location);
         upload->offset = 0;
         upload->expires = response.expires;
         upload->length_declared = upload->length != VECTUS_LENGTH_UNKNOWN;
         if (upload->url == NULL) {
-            code = VECTUS_ERR_PROTOCOL;
+            code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "POST answered a Location header that is not a URL");
         } else if (with_data && (!response.has_offset || response.offset > upload->length)) {
-            code = VECTUS_ERR_PROTOCOL;  /* the URL stays, so the next perform asks the server what it kept */
+            /* the URL stays, so the next perform asks the server what it kept */
+            code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "POST carrying data answered without a valid Upload-Offset");
         } else if (with_data) {
             upload->offset = response.offset;
         }
@@ -377,10 +478,13 @@ static vectus_code upload_fetch_offset(vectus_client client, vectus_upload uploa
         code = VECTUS_ERR_GONE;
     } else if (response.status != 200 && response.status != 204) {
         code = VECTUS_ERR_HTTP_STATUS;
-    } else if (!response.has_offset
-               || (response.has_length && upload->length != VECTUS_LENGTH_UNKNOWN && response.length != upload->length)
-               || response.offset > (response.has_length ? response.length : upload->length)) {
+    } else if (!response.has_offset) {
+        code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "HEAD answered without Upload-Offset");
+    } else if (response.has_length && upload->length != VECTUS_LENGTH_UNKNOWN && response.length != upload->length) {
+        snprintf(upload->error, sizeof upload->error, "the server has the upload as %llu bytes, not %llu", response.length, upload->length);
         code = VECTUS_ERR_PROTOCOL;
+    } else if (response.offset > (response.has_length ? response.length : upload->length)) {
+        code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "HEAD answered an Upload-Offset past the upload's length");
     } else {
         if (response.has_length) upload->length = response.length;  /* a deferred length declared earlier, maybe by another process */
         upload->length_declared = !response.length_deferred;
@@ -410,10 +514,14 @@ static vectus_code upload_send(vectus_client client, vectus_upload upload) {
         code = VECTUS_ERR_GONE;
     } else if (response.status != 204) {
         code = VECTUS_ERR_HTTP_STATUS;  /* 409 when the offset was stale; the next perform asks again */
-    } else if (!response.has_offset || response.offset < upload->offset || response.offset > upload->length
+    } else if (!response.has_offset) {
+        code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "PATCH answered without Upload-Offset");
+    } else if (response.offset < upload->offset || response.offset > upload->length
                || (response.offset == upload->offset && upload->offset < upload->length)) {
         /* An offset going back, or standing still with data left to send, would loop forever.
            Only a PATCH declaring the length of a fully sent stream may leave it where it is */
+        snprintf(upload->error, sizeof upload->error, "PATCH from byte %llu answered an impossible Upload-Offset of %llu",
+                 upload->offset, response.offset);
         code = VECTUS_ERR_PROTOCOL;
     } else {
         upload->offset = response.offset;
@@ -426,7 +534,13 @@ static vectus_code upload_send(vectus_client client, vectus_upload upload) {
 
 vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback read_callback, vectus_seek_callback seek_callback,
                                  void *userdata, unsigned long long length) {
+    if (upload == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
     *upload = NULL;
+    if (read_callback == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
     if (length > UPLOAD_MAX_LENGTH && length != VECTUS_LENGTH_UNKNOWN) {
         return VECTUS_ERR_TOO_LARGE;
     }
@@ -444,8 +558,65 @@ vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback rea
     return VECTUS_OK;
 }
 
+static size_t upload_file_read(void *userdata, char *buffer, size_t size) {
+    FILE *file = userdata;
+    size_t bytes = fread(buffer, 1, size, file);
+
+    return bytes == 0 && ferror(file) ? VECTUS_READ_ABORT : bytes;
+}
+
+static int upload_file_seek(void *userdata, unsigned long long offset) {
+    return fseeko(userdata, (off_t) offset, SEEK_SET);
+}
+
+vectus_code vectus_upload_create_file(vectus_upload *upload, const char *path) {
+    struct stat st;
+    FILE *file;
+    vectus_code code;
+    int reason;
+
+    if (upload == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
+    *upload = NULL;
+    if (path == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return VECTUS_ERR_SOURCE;
+    }
+    if (fstat(fileno(file), &st) != 0) {
+        reason = errno;
+    } else if (!S_ISREG(st.st_mode)) {
+        reason = S_ISDIR(st.st_mode) ? EISDIR : ESPIPE;  /* nothing with a length to seek in */
+    } else {
+        code = vectus_upload_create(upload, upload_file_read, upload_file_seek, file, (unsigned long long) st.st_size);
+        if (code == VECTUS_OK) {
+            (*upload)->file = file;
+        } else {
+            fclose(file);
+        }
+        return code;
+    }
+    fclose(file);
+    errno = reason;  /* for the caller to tell why */
+    return VECTUS_ERR_SOURCE;
+}
+
 void vectus_upload_set_partial(vectus_upload upload) {
+    if (upload == NULL) {
+        return;
+    }
     upload->partial = 1;
+}
+
+void vectus_upload_set_progress(vectus_upload upload, vectus_progress_callback callback, void *userdata) {
+    if (upload == NULL) {
+        return;
+    }
+    upload->progress = callback;
+    upload->progress_userdata = userdata;
 }
 
 vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const *partial_urls, size_t count) {
@@ -454,15 +625,18 @@ vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const 
     char *end;
     size_t i;
 
+    if (upload == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
     *upload = NULL;
-    if (count == 0) {
+    if (partial_urls == NULL || count == 0) {
         return VECTUS_ERR_INVALID;
     }
     /* The URLs go into the header as they are, separated by spaces */
     for (i = 0; i < count; i++) {
         const char *c = partial_urls[i];
 
-        if (*c == '\0') return VECTUS_ERR_INVALID;
+        if (c == NULL || *c == '\0') return VECTUS_ERR_INVALID;
         for (; *c != '\0'; c++) {
             if ((unsigned char) *c <= ' ' || (unsigned char) *c > '~') return VECTUS_ERR_INVALID;
         }
@@ -487,19 +661,61 @@ vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const 
     return VECTUS_OK;
 }
 
+/**
+ * Ask the server what it offers, unless the client already knows, keeping the details on the upload
+ */
+static vectus_code upload_discover(vectus_client client, vectus_upload upload) {
+    vectus_code code;
+
+    CURL *c;
+
+    if (client->discovered) {
+        return VECTUS_OK;
+    }
+    c = upload_handle(upload, "OPTIONS");
+    if (c == NULL) {
+        return VECTUS_ERR_MEMORY;
+    }
+    code = vectus_discover(client, c);
+    upload->status = client->status;
+    memcpy(upload->error, client->error, sizeof upload->error);
+    return code;
+}
+
+/**
+ * Check the server offers what creating the upload needs
+ */
+static vectus_code upload_creatable(vectus_client client, vectus_upload upload) {
+    if (!(client->extensions & VECTUS_EXT_CREATION)) {
+        return upload_fail(upload, VECTUS_ERR_UNSUPPORTED, "the server does not offer the creation extension");
+    }
+    if (upload->length == VECTUS_LENGTH_UNKNOWN && !(client->extensions & VECTUS_EXT_CREATION_DEFER_LENGTH)) {
+        return upload_fail(upload, VECTUS_ERR_UNSUPPORTED, "the server does not offer creation-defer-length, for an unknown length");
+    }
+    if ((upload->partial || upload->final != NULL) && !(client->extensions & VECTUS_EXT_CONCATENATION)) {
+        return upload_fail(upload, VECTUS_ERR_UNSUPPORTED, "the server does not offer concatenation, for partial and final uploads");
+    }
+    if (client->max_size != 0 && upload->length != VECTUS_LENGTH_UNKNOWN && upload->length > client->max_size) {
+        snprintf(upload->error, sizeof upload->error, "the upload's %llu bytes are over the server's Tus-Max-Size of %llu",
+                 upload->length, client->max_size);
+        return VECTUS_ERR_TOO_LARGE;
+    }
+    return VECTUS_OK;
+}
+
 vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload) {
     vectus_code code;
 
+    if (client == NULL || upload == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
+    upload->status = 0;
+    upload->error[0] = '\0';
+
     if (upload->url == NULL) {
-        if (!(client->extensions & VECTUS_EXT_CREATION)
-            || (upload->length == VECTUS_LENGTH_UNKNOWN && !(client->extensions & VECTUS_EXT_CREATION_DEFER_LENGTH))
-            || ((upload->partial || upload->final != NULL) && !(client->extensions & VECTUS_EXT_CONCATENATION))) {
-            return VECTUS_ERR_UNSUPPORTED;
-        }
-        if (client->max_size != 0 && upload->length != VECTUS_LENGTH_UNKNOWN && upload->length > client->max_size) {
-            return VECTUS_ERR_TOO_LARGE;
-        }
-        code = upload_create_remote(client, upload);
+        code = upload_discover(client, upload);  /* only creating needs to know the extensions */
+        if (code == VECTUS_OK) code = upload_creatable(client, upload);
+        if (code == VECTUS_OK) code = upload_create_remote(client, upload);
     } else if (upload->final != NULL) {
         return VECTUS_OK;  /* the server assembled it: nothing to send, and a PATCH would get 403 */
     } else {
@@ -509,16 +725,20 @@ vectus_code vectus_upload_perform(vectus_client client, vectus_upload upload) {
     while (code == VECTUS_OK && (upload->offset < upload->length || upload_declares_length(upload))) {
         code = upload_send(client, upload);
     }
+    if (code == VECTUS_OK) upload->error[0] = '\0';  /* drop the status of the last, successful, response */
     return code;
 }
 
 const char *vectus_upload_url(vectus_upload upload) {
-    return upload->url;
+    return upload != NULL ? upload->url : NULL;
 }
 
 vectus_code vectus_upload_set_url(vectus_upload upload, const char *url) {
     char *copy = NULL;
 
+    if (upload == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
     if (url != NULL) {
         copy = malloc(strlen(url) + 1);
         if (copy == NULL) {
@@ -535,11 +755,19 @@ vectus_code vectus_upload_set_url(vectus_upload upload, const char *url) {
 }
 
 unsigned long long vectus_upload_offset(vectus_upload upload) {
-    return upload->offset;
+    return upload != NULL ? upload->offset : 0;
 }
 
 time_t vectus_upload_expires(vectus_upload upload) {
-    return upload->expires;
+    return upload != NULL ? upload->expires : 0;
+}
+
+long vectus_upload_http_status(vectus_upload upload) {
+    return upload != NULL ? upload->status : 0;
+}
+
+const char *vectus_upload_error(vectus_upload upload) {
+    return upload != NULL ? upload->error : "";
 }
 
 /**
@@ -564,14 +792,22 @@ static void upload_base64(const unsigned char *in, size_t len, char *out) {
 
 vectus_code vectus_upload_add_metadata(vectus_upload upload, const char *key, const char *value) {
     static const char prefix[] = "Upload-Metadata: ";
-    size_t key_len = strlen(key);
-    size_t value_len = strlen(value);
-    size_t used = upload->metadata != NULL ? strlen(upload->metadata) : 0;
-    const char *pair = upload->metadata != NULL ? upload->metadata + sizeof prefix - 1 : NULL;
+    size_t key_len;
+    size_t value_len;
+    size_t used;
+    const char *pair;
     size_t size;
     char *grown;
     char *end;
     size_t i;
+
+    if (upload == NULL || key == NULL || value == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
+    key_len = strlen(key);
+    value_len = strlen(value);
+    used = upload->metadata != NULL ? strlen(upload->metadata) : 0;
+    pair = upload->metadata != NULL ? upload->metadata + sizeof prefix - 1 : NULL;
 
     /* The key goes into the header as it is, where spaces and commas separate the pairs */
     if (key_len == 0) {
@@ -610,11 +846,20 @@ vectus_code vectus_upload_terminate(vectus_client client, vectus_upload upload) 
     struct upload_response response = {0};
     vectus_code code;
 
+    if (client == NULL || upload == NULL) {
+        return VECTUS_ERR_INVALID;
+    }
+    upload->status = 0;
+    upload->error[0] = '\0';
     if (upload->url == NULL) {
         return VECTUS_OK;
     }
+    code = upload_discover(client, upload);
+    if (code != VECTUS_OK) {
+        return code;
+    }
     if (!(client->extensions & VECTUS_EXT_TERMINATION)) {
-        return VECTUS_ERR_UNSUPPORTED;
+        return upload_fail(upload, VECTUS_ERR_UNSUPPORTED, "the server does not offer the termination extension");
     }
 
     code = upload_request(client, upload, UPLOAD_DELETE, upload->url, &response);
@@ -626,6 +871,7 @@ vectus_code vectus_upload_terminate(vectus_client client, vectus_upload upload) 
         code = VECTUS_ERR_HTTP_STATUS;
     } else {
         vectus_upload_set_url(upload, NULL);  /* cannot fail with NULL */
+        upload->error[0] = '\0';
     }
     free(response.location);
     return code;
@@ -638,5 +884,7 @@ void vectus_upload_cleanup(vectus_upload upload) {
     free(upload->url);
     free(upload->metadata);
     free(upload->final);
+    if (upload->file != NULL) fclose(upload->file);
+    curl_easy_cleanup(upload->curl);  /* no-op on NULL */
     free(upload);
 }

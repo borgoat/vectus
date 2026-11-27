@@ -1,7 +1,7 @@
 /*
  * Resuming through Toxiproxy, which breaks the connection to tusd on purpose.
  * VECTUS_TEST_TOXIPROXY is its API, and VECTUS_TEST_PROXIED_URL the tus endpoint behind its proxy named "tusd";
- * tests/e2e-env.sh sets both up. Uses the helpers in upload.c.
+ * tests/e2e-env.sh sets both up. Uses the helpers in upload.c, such as perform_until_done.
  */
 
 static void toxic_add(const char *name, const char *type, const char *attributes) {
@@ -31,30 +31,6 @@ static void toxics_clear(void) {
 /* Hold every byte towards tusd from now on, without closing the connection */
 static void stall_now(void) {
     toxic_add("stall", "timeout", "{\"timeout\":0}");
-}
-
-/*
- * Call perform until the upload is done, as an application would, returning how many calls it took.
- * Only connection and HTTP errors may happen on the way: tusd can briefly hold the interrupted request.
- */
-static int perform_until_done(vectus_client c, vectus_upload u, int attempts) {
-    int i;
-
-    for (i = 1; i <= attempts; i++) {
-        vectus_code code = vectus_upload_perform(c, u);
-
-        if (code == VECTUS_OK) return i;
-        ck_assert_msg(code == VECTUS_ERR_TRANSPORT || code == VECTUS_ERR_HTTP_STATUS, "attempt %d: %s", i, vectus_strerror(code));
-        sleep(1);
-    }
-    ck_abort_msg("the upload was not done after %d attempts", attempts);
-    return 0;
-}
-
-/* The upload resumed from the middle: a seek to an offset the server reported, strictly inside the data */
-static void assert_resumed_mid_way(const struct source *source) {
-    ck_assert_int_ge(source->seeks, 1);
-    ck_assert_msg(source->first_seek > 0 && source->first_seek < 4 * MIB, "resumed from %llu", source->first_seek);
 }
 
 START_TEST(test_resume_after_cut)

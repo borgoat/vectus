@@ -106,33 +106,114 @@ START_TEST(test_strerror)
 {
     vectus_code code;
 
-    for (code = VECTUS_OK; code <= VECTUS_ERR_INVALID; code++) {
+    for (code = VECTUS_OK; code <= VECTUS_ERR_CANCELLED; code++) {
         ck_assert_str_ne(vectus_strerror(code), "unknown error");
     }
     ck_assert_str_eq(vectus_strerror((vectus_code) 99), "unknown error");
 }
 END_TEST
 
-START_TEST(test_vectus_client_init_unreachable)
+START_TEST(test_client_discover_unreachable)
 {
-    vectus_client c = (vectus_client) &c;  /* any non-NULL value, to check init resets it */
+    vectus_client c;
 
-    vectus_client_cleanup(NULL);
-    ck_assert_int_eq(vectus_client_init(&c, "http://127.0.0.1:1/"), VECTUS_ERR_TRANSPORT);  /* nothing listens on port 1 */
-    ck_assert_ptr_null(c);
+    ck_assert_int_eq(vectus_client_create(&c, "http://127.0.0.1:1/"), VECTUS_OK);  /* nothing listens on port 1, but nothing asks yet */
+    ck_assert_str_eq(vectus_client_error(c), "");
+    ck_assert_int_eq(vectus_client_discover(c), VECTUS_ERR_TRANSPORT);
+    ck_assert_msg(strncmp(vectus_client_error(c), "OPTIONS: ", 9) == 0 && strlen(vectus_client_error(c)) > 9, "%s", vectus_client_error(c));
+    ck_assert_int_eq(vectus_client_http_status(c), 0);
+    ck_assert_uint_eq(vectus_client_extensions(c), 0);
+    vectus_client_cleanup(c);
 }
 END_TEST
 
 /* Needs a tus server, e.g. VECTUS_TEST_URL=http://localhost:8080/files/ */
-START_TEST(test_vectus_client_init)
+START_TEST(test_client_discover)
 {
     const char *url = getenv("VECTUS_TEST_URL");
     vectus_client c;
 
-    ck_assert_int_eq(vectus_client_init(&c, url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_discover(c), VECTUS_OK);
     ck_assert_str_eq(c->url, url);
     ck_assert(c->extensions & VECTUS_EXT_CREATION);
+    ck_assert_int_ge(vectus_client_http_status(c), 200);
+    ck_assert_str_eq(vectus_client_error(c), "");
 
     vectus_client_cleanup(c);
+}
+END_TEST
+
+START_TEST(test_client_create)
+{
+    const char *invalid[] = {"", "not a url", "/files/", "http://", "ftp://h/files/", "file:///tmp/files/"};
+    vectus_client c = (vectus_client) &c;  /* any non-NULL value, to check create resets it */
+    size_t i;
+
+    ck_assert_int_eq(vectus_client_create(NULL, "http://h/files/"), VECTUS_ERR_INVALID);
+    ck_assert_int_eq(vectus_client_create(&c, NULL), VECTUS_ERR_INVALID);
+    ck_assert_ptr_null(c);
+    for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        c = (vectus_client) &c;
+        ck_assert_msg(vectus_client_create(&c, invalid[i]) == VECTUS_ERR_INVALID, "case %zu", i);
+        ck_assert_ptr_null(c);
+    }
+
+    ck_assert_int_eq(vectus_client_create(&c, "HTTPS://h:8443/files/"), VECTUS_OK);  /* schemes are case-insensitive */
+    ck_assert_str_eq(c->url, "HTTPS://h:8443/files/");
+    ck_assert(!c->discovered);  /* nothing asked yet */
+    ck_assert_uint_eq(vectus_client_extensions(c), 0);
+    ck_assert(vectus_client_max_size(c) == 0);
+    ck_assert_int_eq(vectus_client_http_status(c), 0);
+    ck_assert_str_eq(vectus_client_error(c), "");
+    vectus_client_cleanup(c);
+}
+END_TEST
+
+/* The client's headers, each followed by a newline */
+static const char *client_headers(vectus_client c) {
+    static char joined[512];
+    struct curl_slist *h;
+
+    joined[0] = '\0';
+    for (h = c->headers; h != NULL; h = h->next) {
+        strcat(joined, h->data);
+        strcat(joined, "\n");
+    }
+    return joined;
+}
+
+START_TEST(test_client_set_header)
+{
+    const char *invalid_names[] = {
+        "", "Bad Name", "Bad:Name", "X\r\nY", "caf\xc3\xa9",
+        "Tus-Resumable", "upload-offset", "Upload-Metadata", "content-type", "Content-Length", "Transfer-Encoding", "Expect",
+        "X-HTTP-Method-Override",
+    };
+    const char *invalid_values[] = {"a\r\nX-Injected: 1", "a\nb", "a\rb", "\x01", "a\x7f"};
+    vectus_client c;
+    size_t i;
+
+    ck_assert_int_eq(vectus_client_create(&c, "http://h/files/"), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_set_header(c, NULL, "1"), VECTUS_ERR_INVALID);
+    for (i = 0; i < sizeof invalid_names / sizeof invalid_names[0]; i++) {
+        ck_assert_msg(vectus_client_set_header(c, invalid_names[i], "1") == VECTUS_ERR_INVALID, "name %zu", i);
+    }
+    for (i = 0; i < sizeof invalid_values / sizeof invalid_values[0]; i++) {
+        ck_assert_msg(vectus_client_set_header(c, "X-A", invalid_values[i]) == VECTUS_ERR_INVALID, "value %zu", i);
+    }
+    ck_assert_ptr_null(c->headers);  /* nothing invalid got in */
+
+    ck_assert_int_eq(vectus_client_set_header(c, "Authorization", "Bearer old"), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_set_header(c, "X-A", "tab\tand caf\xc3\xa9"), VECTUS_OK);  /* tabs and other bytes are fine */
+    ck_assert_int_eq(vectus_client_set_header(c, "X-AB", "kept"), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_set_header(c, "X-Empty", ""), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_set_header(c, "authorization", "Bearer new"), VECTUS_OK);  /* replaces, whatever the case */
+    ck_assert_str_eq(client_headers(c), "X-A: tab\tand caf\xc3\xa9\nX-AB: kept\nX-Empty;\nauthorization: Bearer new\n");
+
+    ck_assert_int_eq(vectus_client_set_header(c, "X-A", NULL), VECTUS_OK);  /* not X-AB, which starts the same */
+    ck_assert_int_eq(vectus_client_set_header(c, "X-Missing", NULL), VECTUS_OK);
+    ck_assert_str_eq(client_headers(c), "X-AB: kept\nX-Empty;\nauthorization: Bearer new\n");
+    vectus_client_cleanup(c);  /* and its headers */
 }
 END_TEST

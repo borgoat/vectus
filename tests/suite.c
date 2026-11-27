@@ -23,14 +23,18 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_client, test_cleanup_without_headers);
     tcase_add_test(tc_client, test_offers_tus_1_0_0);
     tcase_add_test(tc_client, test_strerror);
-    tcase_add_test(tc_client, test_vectus_client_init_unreachable);
+    tcase_add_test(tc_client, test_client_create);
+    tcase_add_test(tc_client, test_client_set_header);
+    tcase_add_test(tc_client, test_client_discover_unreachable);
     if (getenv("VECTUS_TEST_URL") != NULL) {
-        tcase_add_test(tc_client, test_vectus_client_init);
+        tcase_add_test(tc_client, test_client_discover);
     }
     suite_add_tcase(s, tc_client);
 
     tc_upload = tcase_create("upload");
     tcase_set_timeout(tc_upload, 30);  /* Check's default is 4 seconds */
+    tcase_add_test(tc_upload, test_null_handles);
+    tcase_add_test(tc_upload, test_upload_create_file);
     tcase_add_test(tc_upload, test_upload_headers);
     tcase_add_test(tc_upload, test_upload_resolve_url);
     tcase_add_test(tc_upload, test_upload_read_wrapper);
@@ -60,6 +64,14 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_upload, test_upload_fake_resume_needs_seek);
     tcase_add_test(tc_upload, test_upload_fake_partial_accept);
     tcase_add_test(tc_upload, test_upload_fake_source_fails);
+    tcase_add_test(tc_upload, test_client_fake_discover);
+    tcase_add_test(tc_upload, test_upload_fake_auth_refresh);
+    tcase_add_test(tc_upload, test_upload_fake_headers_everywhere);
+    tcase_add_test(tc_upload, test_upload_fake_resume_without_discovery);
+    tcase_add_test(tc_upload, test_upload_fake_connection_reuse);
+    tcase_add_test(tc_upload, test_upload_fake_progress);
+    tcase_add_test(tc_upload, test_upload_fake_cancel);
+    tcase_add_test(tc_upload, test_upload_fake_file);
     suite_add_tcase(s, tc_upload);
 
     if (getenv("VECTUS_TEST_URL") != NULL) {
@@ -75,6 +87,9 @@ Suite *vectus_suite(void) {
         tcase_add_test(tc_live, test_upload_live_length_mismatch);
         tcase_add_test(tc_live, test_upload_live_gone);
         tcase_add_test(tc_live, test_upload_live_too_large);
+        tcase_add_test(tc_live, test_upload_live_file);
+        tcase_add_test(tc_live, test_upload_live_progress_cancel);
+        tcase_add_test(tc_live, test_upload_live_parallel);
         suite_add_tcase(s, tc_live);
     }
 

@@ -52,15 +52,22 @@ jobs:
         run: |
           ctest --test-dir build --output-on-failure --verbose | tee ctest.log
           # ctest passes the same when live tests are skipped, so check each one really ran
-          for test in test_vectus_client_init test_upload_live test_upload_live_small test_upload_live_deferred \
+          for test in test_client_discover test_upload_live test_upload_live_small test_upload_live_deferred \
                       test_upload_live_concatenation test_upload_live_method_override \
                       test_upload_live_empty test_upload_live_resume \
                       test_upload_live_length_mismatch test_upload_live_gone test_upload_live_too_large \
+                      test_upload_live_file test_upload_live_progress_cancel test_upload_live_parallel \
                       test_resume_after_cut test_resume_deferred_after_cut test_resume_after_stall test_resume_repeatedly; do
             grep -q ":$test:0: Passed" ctest.log || { echo "$test did not pass"; exit 1; }
           done
         env:
           CK_VERBOSITY: verbose
+      - name: Upload a file with the example program, and download it back
+        run: |
+          head -c 3000000 /dev/urandom > example.bin
+          url=$(build/vectus-upload "$VECTUS_TEST_URL" example.bin)
+          curl -fsS "$url" -o downloaded.bin
+          cmp example.bin downloaded.bin
 
   fuzz:
     runs-on: ubuntu-24.04

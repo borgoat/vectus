@@ -34,14 +34,18 @@ install(FILES cmake/vectusConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/vectusConfigV
 configure_file(cmake/vectus.pc.in vectus.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vectus.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
-# Tests only for the top-level project, so projects embedding vectus don't need Check
+# The example and tests only for the top-level project, so projects embedding vectus don't build them or need Check
 if(PROJECT_IS_TOP_LEVEL)
     include(CTest)
+    add_executable(vectus-upload examples/upload.c)
+    target_link_libraries(vectus-upload PRIVATE vectus)
+    target_compile_options(vectus-upload PRIVATE ${VECTUS_WARNINGS})
 endif()
 
 if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CHECK REQUIRED IMPORTED_TARGET check)
+    find_package(Threads REQUIRED)  # uploads on several threads sharing a client
 
     # The tests compile src/client.c themselves, so this sanitizes the code under test without touching the installed library
     include(CheckCSourceCompiles)
@@ -58,7 +62,7 @@ if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING)
 
     add_executable(vectus-test tests/suite.c)
     target_include_directories(vectus-test PRIVATE include)
-    target_link_libraries(vectus-test PRIVATE CURL::libcurl PkgConfig::CHECK)
+    target_link_libraries(vectus-test PRIVATE CURL::libcurl PkgConfig::CHECK Threads::Threads)
     target_compile_options(vectus-test PRIVATE ${VECTUS_WARNINGS} ${VECTUS_SANITIZE})
     target_link_options(vectus-test PRIVATE ${VECTUS_SANITIZE})
     add_test(NAME vectus-test COMMAND vectus-test)
