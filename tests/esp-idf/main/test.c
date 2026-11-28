@@ -353,8 +353,9 @@ static void check_cancel_and_terminate(void) {
     code = perform(c, u);
     CHECK(code == VECTUS_ERR_CANCELLED && vectus_upload_url(u) != NULL, "the progress callback cancelled the PATCH");
     cancel = 0;
-    /* tusd may not have stored the cancelled PATCH's bytes yet when HEAD asks, so this may start over */
-    CHECK(perform_until_done(c, u) > 0, "resumed from byte %llu", s.first_seek);
+    /* Resumed, not started over: no seek when the server kept all that was read, otherwise one into the middle */
+    CHECK(perform_until_done(c, u) > 0 && (s.seeks == 0 || (s.first_seek > 0 && s.first_seek < s.length)), "resumed, %s",
+          s.seeks == 0 ? "the server having kept all that was read" : "seeking into the middle");
     CHECK(download_matches(u, s.length), "the upload downloads back byte for byte");
     code = vectus_upload_terminate(c, u);
     CHECK(code == VECTUS_OK && vectus_upload_url(u) == NULL, "DELETE: %s", vectus_strerror(code));
