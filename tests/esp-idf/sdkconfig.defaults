@@ -1,0 +1,2 @@
+# An HTTPS handshake needs more stack than the main task's default 3584 bytes
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

@@ -74,6 +74,16 @@ jobs:
           curl -fsS "$url" -o downloaded.bin
           cmp example.bin downloaded.bin
 
+  esp-idf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start tusd and Toxiproxy
+        run: tests/e2e-env.sh > /dev/null
+      - name: Run the tests on ESP-IDF's linux target, and build them for the ESP32
+        run: tests/esp-idf/run.sh
+
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

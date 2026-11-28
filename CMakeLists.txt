@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.21)
+
+# As an ESP-IDF component: the core and the esp_http_client transport
+if(ESP_PLATFORM)
+    idf_component_register(SRCS src/client.c src/upload.c src/esp.c
+                           INCLUDE_DIRS include
+                           REQUIRES esp_http_client  # vectus/esp.h includes its header
+                           PRIV_REQUIRES mbedtls)    # for the certificate bundle
+    return()
+endif()
+
 project(vectus VERSION 0.1.0 DESCRIPTION "tus resumable upload client" LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
