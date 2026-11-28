@@ -29,7 +29,7 @@ typedef enum {
     VECTUS_ERR_TRANSPORT,    /* the server could not be reached: DNS, connection, TLS or timeout */
     VECTUS_ERR_HTTP_STATUS,  /* the server answered with an unexpected HTTP status, such as 401 for missing credentials */
     VECTUS_ERR_PROTOCOL,     /* the server does not offer tus 1.0.0, or broke the protocol */
-    VECTUS_ERR_TOO_LARGE,    /* the upload is larger than the server or curl accept */
+    VECTUS_ERR_TOO_LARGE,    /* the upload is larger than the server accepts, or than 2^63 - 1 bytes */
     VECTUS_ERR_GONE,         /* the upload no longer exists on the server (404, 410, or 403 as the tus spec allows); forget its URL to start over */
     VECTUS_ERR_SOURCE,       /* the data to upload could not be opened or read, or resuming needed a seek that failed or is not possible */
     VECTUS_ERR_UNSUPPORTED,  /* the server does not offer the tus extension this needs */
@@ -48,18 +48,15 @@ const char *vectus_strerror(vectus_code code);
  * vectus_client represents a tus client connected to 1 tus server.
  * Every function taking one accepts NULL: getters then return 0 or "", the others VECTUS_ERR_INVALID or nothing.
  *
- * vectus is built on libcurl. Before starting threads, call curl_global_init(CURL_GLOBAL_DEFAULT) once, unless your
- * libcurl is 7.84 or newer and built thread-safe. Several threads may then share one client, each with its own uploads,
- * once vectus_client_discover succeeded and while none of the setters below run.
+ * Several threads may share one client, each with its own uploads, once vectus_client_discover succeeded and while
+ * none of the setters below run, if its transport allows it: see vectus/curl.h for libcurl's.
  */
 typedef struct vectus_client_s *vectus_client;
 
 /**
- * Called with each request's curl handle, a CURL *, just before it goes out, to set what vectus has no setting for,
- * such as CURLOPT_CAINFO for a private certificate authority, CURLOPT_PROXY, or CURLOPT_VERBOSE.
- * Leave alone what vectus sets: the URL, method, headers (use vectus_client_set_header), body and callbacks
+ * What carries a client's HTTP requests, see vectus/transport.h; vectus/curl.h has libcurl's
  */
-typedef void (*vectus_curl_callback)(void *userdata, void *curl);
+struct vectus_transport;
 
 /**
  * Create a vectus_client for the tus server at url, without contacting it yet, so it can be configured first.
@@ -67,9 +64,12 @@ typedef void (*vectus_curl_callback)(void *userdata, void *curl);
  *
  * @param client set to the new vectus_client on success, to NULL otherwise
  * @param url the tus server's upload endpoint, an http or https URL
- * @return VECTUS_OK, VECTUS_ERR_INVALID for anything but an http or https URL, or VECTUS_ERR_MEMORY
+ * @param transport sends the requests, such as vectus_curl_transport(); it must outlive the client
+ * @param transport_userdata passed to the transport, such as its options; it must outlive the client
+ * @return VECTUS_OK, VECTUS_ERR_INVALID for anything but an http or https URL or for no transport, or VECTUS_ERR_MEMORY
  */
-vectus_code vectus_client_create(vectus_client *client, const char *url);
+vectus_code vectus_client_create(vectus_client *client, const char *url, const struct vectus_transport *transport,
+                                 void *transport_userdata);
 
 /**
  * Send a header on every request to the server, such as Authorization.
@@ -89,14 +89,6 @@ vectus_code vectus_client_set_header(vectus_client client, const char *name, con
  * @param enabled non-zero to turn it on
  */
 void vectus_client_set_method_override(vectus_client client, int enabled);
-
-/**
- * Call callback with each request's curl handle before it goes out, see vectus_curl_callback
- *
- * @param callback the function to call, or NULL to stop calling one
- * @param userdata passed to callback
- */
-void vectus_client_set_curl_callback(vectus_client client, vectus_curl_callback callback, void *userdata);
 
 /**
  * Ask the server which tus versions and extensions it offers, and the largest upload it accepts.
@@ -130,7 +122,7 @@ unsigned long long vectus_client_max_size(vectus_client client);
 long vectus_client_http_status(vectus_client client);
 
 /**
- * Why the last vectus_client_discover failed, in more detail than vectus_strerror: curl's reason, the HTTP status,
+ * Why the last vectus_client_discover failed, in more detail than vectus_strerror: the transport's reason, the HTTP status,
  * or what the server got wrong
  *
  * @return a message valid until the next call on the client, "" when it succeeded

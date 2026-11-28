@@ -12,83 +12,45 @@
 
 
 /**
- * Convert Tus-Extensions into the extensions flags
- * Something like creation,creation-with-upload,termination,concatenation,creation-defer-length
- *
- * @param extensions
- * @return
+ * A copy of s to be freed, or NULL out of memory
  */
-static unsigned int parse_extensions(char *extensions) {
-    unsigned int ext_flag = 0;
-    char *current = extensions;
-    char *next = NULL;
+static char *client_copy(const char *s) {
+    char *copy = malloc(strlen(s) + 1);
 
-    for (;;) {
-        next = strchr(current, ',');
-        if (next != NULL) *next = '\0';
-
-        /* HTTP lists allow whitespace around the commas */
-        current += strspn(current, " \t");
-        current[strcspn(current, " \t")] = '\0';
-
-        if (strcmp(current, "creation") == 0) {
-            ext_flag |= VECTUS_EXT_CREATION;
-        } else if (strcmp(current, "creation-with-upload") == 0) {
-            ext_flag |= VECTUS_EXT_CREATION_WITH_UPLOAD;
-        } else if (strcmp(current, "termination") == 0) {
-            ext_flag |= VECTUS_EXT_TERMINATION;
-        } else if (strcmp(current, "concatenation") == 0) {
-            ext_flag |= VECTUS_EXT_CONCATENATION;
-        } else if (strcmp(current, "expiration") == 0) {
-            ext_flag |= VECTUS_EXT_EXPIRATION;
-        } else if (strcmp(current, "checksum") == 0) {
-            ext_flag |= VECTUS_EXT_CHECKSUM;
-        } else if (strcmp(current, "creation-defer-length") == 0) {
-            ext_flag |= VECTUS_EXT_CREATION_DEFER_LENGTH;
-        }
-
-        if (next == NULL) break;
-        current = next + 1;
-    }
-
-    return ext_flag;
-}
-
-size_t vectus_parse_header_line(const char *buffer, size_t bytes, void (*handle)(void *target, const char *name, char *value), void *target) {
-    char *line = malloc(bytes + 1);  /* curl's buffer is not null-terminated, so parse a terminated copy */
-    char *value;
-    char *end;
-
-    if (line == NULL) {
-        return 0;
-    }
-    memcpy(line, buffer, bytes);
-    line[bytes] = '\0';
-
-    value = strchr(line, ':');
-    if (value != NULL) {
-        *value++ = '\0';  /* line is now the null-terminated header name */
-
-        /* Trim whitespace and the CRLF around the value */
-        value += strspn(value, " \t");
-        end = value + strlen(value);
-        while (end > value && strchr(" \t\r\n", end[-1]) != NULL) end--;
-        *end = '\0';
-
-        handle(target, line, value);
-    }
-
-    free(line);
-    return bytes;
+    if (copy != NULL) strcpy(copy, s);
+    return copy;
 }
 
 /**
- * A curl write callback that drops the response body, which curl would otherwise print to the application's stdout
+ * Convert Tus-Extension, such as "creation,creation-with-upload,termination", into the extensions flags
  */
-static size_t discard_body(char *buffer, size_t size, size_t nitems, void *userdata) {
-    (void) buffer;
-    (void) userdata;
-    return size * nitems;
+static unsigned int parse_extensions(const char *extensions) {
+    static const struct {
+        const char *name;
+        unsigned int flag;
+    } known[] = {
+        {"creation", VECTUS_EXT_CREATION},
+        {"creation-with-upload", VECTUS_EXT_CREATION_WITH_UPLOAD},
+        {"termination", VECTUS_EXT_TERMINATION},
+        {"concatenation", VECTUS_EXT_CONCATENATION},
+        {"expiration", VECTUS_EXT_EXPIRATION},
+        {"checksum", VECTUS_EXT_CHECKSUM},
+        {"creation-defer-length", VECTUS_EXT_CREATION_DEFER_LENGTH},
+    };
+    unsigned int flags = 0;
+    size_t i;
+
+    while (*extensions != '\0') {
+        size_t len;
+
+        extensions += strspn(extensions, " \t,");  /* HTTP lists allow whitespace around the commas */
+        len = strcspn(extensions, " \t,");
+        for (i = 0; i < sizeof known / sizeof known[0]; i++) {
+            if (strlen(known[i].name) == len && strncmp(extensions, known[i].name, len) == 0) flags |= known[i].flag;
+        }
+        extensions += len;
+    }
+    return flags;
 }
 
 int vectus_parse_size(const char *value, unsigned long long *size) {
@@ -110,33 +72,19 @@ int vectus_parse_size(const char *value, unsigned long long *size) {
 /**
  * Store one response header into the client asking the server what it offers
  */
-static void client_handle_header(void *target, const char *name, char *value) {
-    vectus_client v = target;
+static void client_handle_header(void *userdata, const char *name, const char *value) {
+    vectus_client v = userdata;
 
     /* Header names are case-insensitive, and HTTP/2 sends them lowercase */
     if (curl_strequal(name, "Tus-Version")) {
         free(v->version);
-        v->version = malloc(strlen(value) + 1);
-        if (v->version != NULL) strcpy(v->version, value);
-        else v->out_of_memory = 1;
+        v->version = client_copy(value);
+        if (v->version == NULL) v->out_of_memory = 1;
     } else if (curl_strequal(name, "Tus-Extension")) {
         v->extensions = parse_extensions(value);
     } else if (curl_strequal(name, "Tus-Max-Size")) {
         vectus_parse_size(value, &v->max_size);  /* an invalid value leaves it at 0, meaning no known limit */
     }
-}
-
-/**
- * Used to fetch the tus extensions the server implements while discovering it
- *
- * @param buffer one header line, not null-terminated
- * @param size
- * @param nitems
- * @param userdata the vectus_client discovering the server
- * @return the bytes handled; anything else makes curl abort the transfer
- */
-static size_t client_init_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
-    return vectus_parse_header_line(buffer, size * nitems, client_handle_header, userdata);
 }
 
 /**
@@ -171,45 +119,62 @@ const char *vectus_strerror(vectus_code code) {
     return "unknown error";
 }
 
-vectus_code vectus_request(vectus_client client, CURL *c, const char *method, struct curl_slist **headers, char *error, long *status) {
-    char reason[CURL_ERROR_SIZE] = "";
-    struct curl_slist *h;
-    CURLcode res;
+void vectus_close(struct vectus_connection *connection) {
+    if (connection->handle != NULL) connection->transport->close(connection->handle);
+    connection->handle = NULL;
+}
+
+vectus_code vectus_send(vectus_client client, struct vectus_connection *connection, const char *name, vectus_request *request,
+                        char *error, long *status) {
+    const char *const *own = request->headers;
+    const char **headers;
+    char reason[VECTUS_ERROR_SIZE] = "";
+    size_t own_count = 0;
+    size_t app_count = 0;
+    vectus_code code;
 
     *status = 0;
-    for (h = client->headers; h != NULL; h = h->next) {
-        struct curl_slist *appended = curl_slist_append(*headers, h->data);
+    while (own[own_count] != NULL) own_count++;
+    while (client->headers != NULL && client->headers[app_count] != NULL) app_count++;
 
-        if (appended == NULL) {
-            snprintf(error, VECTUS_ERROR_SIZE, "%s: out of memory", method);
+    /* An upload may move to a client with another transport, whose connections the old one cannot use */
+    if (connection->transport != client->transport || connection->userdata != client->transport_userdata) {
+        vectus_close(connection);
+    }
+    if (connection->handle == NULL) {
+        connection->transport = client->transport;
+        connection->userdata = client->transport_userdata;
+        if (client->transport->open(client->transport_userdata, &connection->handle) != VECTUS_OK) {
+            connection->handle = NULL;
+            snprintf(error, VECTUS_ERROR_SIZE, "%s: out of memory", name);
             return VECTUS_ERR_MEMORY;
         }
-        *headers = appended;
     }
+    headers = malloc((own_count + app_count + 1) * sizeof *headers);
+    if (headers == NULL) {
+        snprintf(error, VECTUS_ERROR_SIZE, "%s: out of memory", name);
+        return VECTUS_ERR_MEMORY;
+    }
+    memcpy(headers, own, own_count * sizeof *headers);
+    if (app_count > 0) memcpy(headers + own_count, client->headers, app_count * sizeof *headers);
+    headers[own_count + app_count] = NULL;
 
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER, *headers);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, discard_body);
-    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, reason);
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);  /* curl's signal-based DNS timeout is not safe with threads */
-    curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);  /* give up on a stalled connection, so the upload can resume */
-    curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, client->stall_timeout);
-    if (client->curl_callback != NULL) {
-        client->curl_callback(client->curl_userdata, c);
+    request->headers = headers;
+    code = client->transport->perform(connection->handle, request, status, reason, sizeof reason);
+    request->headers = own;
+    free(headers);
+    if (code != VECTUS_OK) {
+        /* shortcut: every transport failure becomes VECTUS_ERR_TRANSPORT; split it when callers need to tell DNS, connection and TLS errors apart */
+        *status = 0;
+        snprintf(error, VECTUS_ERROR_SIZE, "%s: %.200s", name, reason[0] != '\0' ? reason : vectus_strerror(code));
+        return code == VECTUS_ERR_MEMORY ? VECTUS_ERR_MEMORY : VECTUS_ERR_TRANSPORT;
     }
-
-    res = curl_easy_perform(c);
-    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, NULL);  /* reason goes out of scope */
-    if (res != CURLE_OK) {
-        /* shortcut: every curl failure becomes VECTUS_ERR_TRANSPORT; split it when callers need to tell DNS, connection and TLS errors apart */
-        snprintf(error, VECTUS_ERROR_SIZE, "%s: %.200s", method, reason[0] != '\0' ? reason : curl_easy_strerror(res));
-        return res == CURLE_OUT_OF_MEMORY ? VECTUS_ERR_MEMORY : VECTUS_ERR_TRANSPORT;
-    }
-    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, status);
-    snprintf(error, VECTUS_ERROR_SIZE, "%s answered HTTP %ld", method, *status);  /* what went wrong, unless the caller finds otherwise */
+    snprintf(error, VECTUS_ERROR_SIZE, "%s answered HTTP %ld", name, *status);  /* what went wrong, unless the caller finds otherwise */
     return VECTUS_OK;
 }
 
-vectus_code vectus_client_create(vectus_client *client, const char *url) {
+vectus_code vectus_client_create(vectus_client *client, const char *url, const struct vectus_transport *transport,
+                                 void *transport_userdata) {
     CURLU *u;
     char *scheme = NULL;
     vectus_code code = VECTUS_ERR_MEMORY;
@@ -218,7 +183,7 @@ vectus_code vectus_client_create(vectus_client *client, const char *url) {
         return VECTUS_ERR_INVALID;
     }
     *client = NULL;
-    if (url == NULL) {
+    if (url == NULL || transport == NULL || transport->open == NULL || transport->perform == NULL || transport->close == NULL) {
         return VECTUS_ERR_INVALID;
     }
     u = curl_url();
@@ -230,10 +195,10 @@ vectus_code vectus_client_create(vectus_client *client, const char *url) {
         code = VECTUS_ERR_INVALID;
     } else {
         *client = calloc(1, sizeof(struct vectus_client_s));  /* zeroed: no headers, nothing discovered */
-        if (*client != NULL) (*client)->url = malloc(strlen(url) + 1);
+        if (*client != NULL) (*client)->url = client_copy(url);
         if (*client != NULL && (*client)->url != NULL) {
-            strcpy((*client)->url, url);
-            (*client)->stall_timeout = VECTUS_DEFAULT_STALL_TIMEOUT;
+            (*client)->transport = transport;
+            (*client)->transport_userdata = transport_userdata;
             code = VECTUS_OK;
         } else {
             vectus_client_cleanup(*client);
@@ -262,19 +227,19 @@ static int header_reserved(const char *name) {
 }
 
 vectus_code vectus_client_set_header(vectus_client client, const char *name, const char *value) {
-    size_t name_len;
-    struct curl_slist *kept = NULL;
-    struct curl_slist *appended;
-    struct curl_slist *h;
-    char *line;
+    char *name_copy = NULL;
+    char *value_copy = NULL;
+    char **headers;
+    size_t count = 0;
+    size_t kept = 0;
+    size_t i;
     const char *ch;
 
     if (client == NULL || name == NULL) {
         return VECTUS_ERR_INVALID;
     }
     /* A token, as HTTP defines header names, which also keeps out spaces, colons and line breaks */
-    name_len = strlen(name);
-    if (name_len == 0 || name[strspn(name, "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")] != '\0'
+    if (*name == '\0' || name[strspn(name, "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")] != '\0'
         || header_reserved(name)) {
         return VECTUS_ERR_INVALID;
     }
@@ -282,67 +247,52 @@ vectus_code vectus_client_set_header(vectus_client client, const char *name, con
         if (((unsigned char) *ch < ' ' && *ch != '\t') || *ch == 0x7f) return VECTUS_ERR_INVALID;
     }
 
-    /* Build the new list aside, so running out of memory leaves the old one as it was */
-    for (h = client->headers; h != NULL; h = h->next) {
-        if (curl_strnequal(h->data, name, name_len) && (h->data[name_len] == ':' || h->data[name_len] == ';')) {
-            continue;  /* the header being replaced or removed */
+    /* Allocate everything first, so running out of memory leaves the old headers as they were */
+    while (client->headers != NULL && client->headers[count] != NULL) count += 2;
+    if (value != NULL && ((name_copy = client_copy(name)) == NULL || (value_copy = client_copy(value)) == NULL)) {
+        free(name_copy);
+        return VECTUS_ERR_MEMORY;
+    }
+    headers = malloc((count + 3) * sizeof *headers);
+    if (headers == NULL) {
+        free(name_copy);
+        free(value_copy);
+        return VECTUS_ERR_MEMORY;
+    }
+    for (i = 0; i < count; i += 2) {
+        if (curl_strequal(client->headers[i], name)) {  /* the header being replaced or removed */
+            free(client->headers[i]);
+            free(client->headers[i + 1]);
+        } else {
+            headers[kept++] = client->headers[i];
+            headers[kept++] = client->headers[i + 1];
         }
-        appended = curl_slist_append(kept, h->data);
-        if (appended == NULL) {
-            curl_slist_free_all(kept);
-            return VECTUS_ERR_MEMORY;
-        }
-        kept = appended;
     }
     if (value != NULL) {
-        size_t size = name_len + strlen(value) + 3;
-
-        line = malloc(size);
-        appended = NULL;
-        if (line != NULL) {
-            /* curl drops a header written "Name:", and sends "Name;" as one with an empty value */
-            snprintf(line, size, *value == '\0' ? "%s;" : "%s: %s", name, value);
-            appended = curl_slist_append(kept, line);
-            free(line);
-        }
-        if (appended == NULL) {
-            curl_slist_free_all(kept);
-            return VECTUS_ERR_MEMORY;
-        }
-        kept = appended;
+        headers[kept++] = name_copy;
+        headers[kept++] = value_copy;
     }
-    curl_slist_free_all(client->headers);
-    client->headers = kept;
+    headers[kept] = NULL;
+    free(client->headers);
+    client->headers = headers;
     return VECTUS_OK;
 }
 
-void vectus_client_set_curl_callback(vectus_client client, vectus_curl_callback callback, void *userdata) {
-    if (client == NULL) {
-        return;
-    }
-    client->curl_callback = callback;
-    client->curl_userdata = userdata;
-}
-
 vectus_code vectus_client_discover(vectus_client client) {
-    CURL *c;
+    struct vectus_connection connection = {0};
     vectus_code code;
 
     if (client == NULL) {
         return VECTUS_ERR_INVALID;
     }
-    c = curl_easy_init();
-    if (c == NULL) {
-        snprintf(client->error, sizeof client->error, "OPTIONS: out of memory");
-        return VECTUS_ERR_MEMORY;
-    }
-    code = vectus_discover(client, c);
-    curl_easy_cleanup(c);
+    code = vectus_discover(client, &connection);
+    vectus_close(&connection);
     return code;
 }
 
-vectus_code vectus_discover(vectus_client client, CURL *c) {
-    struct curl_slist *headers = NULL;
+vectus_code vectus_discover(vectus_client client, struct vectus_connection *connection) {
+    static const char *const none[] = {NULL};  /* not even Tus-Resumable, which the spec asks OPTIONS to leave out */
+    vectus_request request = {0};
     vectus_code code;
 
     /* Forget what an earlier answer said */
@@ -354,15 +304,15 @@ vectus_code vectus_discover(vectus_client client, CURL *c) {
     client->out_of_memory = 0;
     client->status = 0;
 
-    curl_easy_setopt(c, CURLOPT_URL, client->url);
-    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "OPTIONS");
-    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, client_init_header_callback);
-    curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) client);
-    code = vectus_request(client, c, "OPTIONS", &headers, client->error, &client->status);
-    curl_slist_free_all(headers);
+    request.method = "OPTIONS";
+    request.url = client->url;
+    request.headers = none;
+    request.header = client_handle_header;
+    request.userdata = client;
+    code = vectus_send(client, connection, "OPTIONS", &request, client->error, &client->status);
 
     if (code != VECTUS_OK) {
-        /* keep the code and curl's reason */
+        /* keep the code and the transport's reason */
     } else if (client->out_of_memory) {
         snprintf(client->error, sizeof client->error, "OPTIONS: out of memory");
         code = VECTUS_ERR_MEMORY;
@@ -405,11 +355,14 @@ void vectus_client_set_method_override(vectus_client client, int enabled) {
 }
 
 void vectus_client_cleanup(vectus_client client) {
+    size_t i;
+
     if (client == NULL) {
         return;
     }
     free(client->url);
     free(client->version);
-    curl_slist_free_all(client->headers);
+    for (i = 0; client->headers != NULL && client->headers[i] != NULL; i++) free(client->headers[i]);
+    free(client->headers);
     free(client);
 }

@@ -110,19 +110,29 @@ static int progress_record(void *userdata, unsigned long long offset, unsigned l
 }
 
 /* A curl callback counting its calls, and setting an option the fake server can see */
-static void set_user_agent(void *userdata, void *curl) {
+static void set_user_agent(void *userdata, CURL *curl) {
     int *calls = userdata;
 
     (*calls)++;
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "vectus-test/1");
 }
 
+/* curl options giving up on a request after fewer seconds without a byte moving than the 30 it waits otherwise */
+static void set_stall_timeout(void *userdata, CURL *curl) {
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, *(long *) userdata);
+}
+static long one_second = 1;
+static long two_seconds = 2;
+static long five_seconds = 5;
+static struct vectus_curl_options stall_1s = {set_stall_timeout, &one_second};
+static struct vectus_curl_options stall_2s = {set_stall_timeout, &two_seconds};
+static struct vectus_curl_options stall_5s = {set_stall_timeout, &five_seconds};
+
 /* A client for a server the test controls, as if it had already asked the server what it offers */
 static vectus_client test_client(const char *url) {
     vectus_client c;
 
-    ck_assert_int_eq(vectus_client_create(&c, url), VECTUS_OK);
-    c->stall_timeout = 5;
+    ck_assert_int_eq(vectus_client_create(&c, url, vectus_curl_transport(), &stall_5s), VECTUS_OK);
     c->extensions = VECTUS_EXT_CREATION | VECTUS_EXT_TERMINATION;  /* as tusd offers by default */
     c->discovered = 1;
     return c;
@@ -335,11 +345,12 @@ static void assert_detail(vectus_upload u, const struct expectation *expected, s
 /* ---- Unit tests ---- */
 
 static void feed_upload_header(struct upload_response *response, const char *line) {
+    struct upload_exchange exchange = {NULL, response};
     size_t len = strlen(line);
     char *buffer = malloc(len);  /* exact size, like curl's unterminated buffer */
 
     memcpy(buffer, line, len);
-    ck_assert_uint_eq(upload_header_callback(buffer, 1, len, response), len);
+    ck_assert_uint_eq(easy_parse_header_line(buffer, len, upload_handle_header, &exchange), len);
     free(buffer);
 }
 
@@ -385,6 +396,13 @@ START_TEST(test_upload_resolve_url)
 }
 END_TEST
 
+/* Read through the wrapper the transport calls */
+static size_t read_through(vectus_upload u, char *buffer, size_t size) {
+    struct upload_exchange exchange = {u, NULL};
+
+    return upload_read(&exchange, buffer, size);
+}
+
 START_TEST(test_upload_read_wrapper)
 {
     struct source source = {0};
@@ -393,20 +411,20 @@ START_TEST(test_upload_read_wrapper)
 
     ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 10), VECTUS_OK);
     u->position = source.position = 8;
-    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), 2);  /* never past the length */
+    ck_assert_uint_eq(read_through(u, buffer, sizeof buffer), 2);  /* never past the length */
     ck_assert((unsigned char) buffer[1] == source_byte(9));
     ck_assert(u->position == 10);
-    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), 0);
+    ck_assert_uint_eq(read_through(u, buffer, sizeof buffer), 0);
     ck_assert_int_eq(source.reads, 1);  /* the end needs no read */
 
     u->position = source.position = 0;
     source.failure = SOURCE_ENDS_EARLY;
-    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), CURL_READFUNC_ABORT);
+    ck_assert_uint_eq(read_through(u, buffer, sizeof buffer), VECTUS_READ_ABORT);
     ck_assert(u->source_failed);
 
     u->source_failed = 0;
     source.failure = SOURCE_ABORTS;
-    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), CURL_READFUNC_ABORT);
+    ck_assert_uint_eq(read_through(u, buffer, sizeof buffer), VECTUS_READ_ABORT);
     ck_assert(u->source_failed);
     ck_assert(u->position == 0);
     vectus_upload_cleanup(u);
@@ -416,8 +434,8 @@ START_TEST(test_upload_read_wrapper)
     source.failure = SOURCE_ENDS_EARLY;
     source.fail_at = 7;
     ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, VECTUS_LENGTH_UNKNOWN), VECTUS_OK);
-    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), 7);
-    ck_assert_uint_eq(upload_read_callback(buffer, 1, sizeof buffer, u), 0);
+    ck_assert_uint_eq(read_through(u, buffer, sizeof buffer), 7);
+    ck_assert_uint_eq(read_through(u, buffer, sizeof buffer), 0);
     ck_assert(!u->source_failed);
     ck_assert(u->length == 7);
     vectus_upload_cleanup(u);
@@ -498,14 +516,14 @@ START_TEST(test_upload_metadata)
     ck_assert_ptr_null(u->metadata);
     ck_assert_int_eq(vectus_upload_add_metadata(u, "filename", "world_domination_plan.pdf"), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_add_metadata(u, "is_confidential", ""), VECTUS_OK);
-    ck_assert_str_eq(u->metadata, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential");  /* the spec's example */
+    ck_assert_str_eq(u->metadata, "filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential");  /* the spec's example */
 
     for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
         ck_assert_msg(vectus_upload_add_metadata(u, invalid[i], "x") == VECTUS_ERR_INVALID, "case %zu", i);
     }
     ck_assert_int_eq(vectus_upload_add_metadata(u, "file", "x"), VECTUS_OK);  /* a prefix of a key is another key */
     ck_assert_int_eq(vectus_upload_add_metadata(u, "is_confidential", "x"), VECTUS_ERR_INVALID);  /* now followed by a comma */
-    ck_assert_str_eq(u->metadata, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential,file eA==");
+    ck_assert_str_eq(u->metadata, "filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==,is_confidential,file eA==");
     vectus_upload_cleanup(u);
 }
 END_TEST
@@ -527,10 +545,10 @@ START_TEST(test_upload_create_final)
     }
 
     ck_assert_int_eq(vectus_upload_create_final(&u, urls, 1), VECTUS_OK);
-    ck_assert_str_eq(u->final, "Upload-Concat: final;/files/a");
+    ck_assert_str_eq(u->final, "final;/files/a");
     vectus_upload_cleanup(u);
     ck_assert_int_eq(vectus_upload_create_final(&u, urls, 2), VECTUS_OK);
-    ck_assert_str_eq(u->final, "Upload-Concat: final;/files/a http://h/files/b");  /* as the spec's example */
+    ck_assert_str_eq(u->final, "final;/files/a http://h/files/b");  /* as the spec's example */
     ck_assert(u->length == 0);
     vectus_upload_cleanup(u);
 }
@@ -623,7 +641,7 @@ START_TEST(test_upload_stall)
     snprintf(url, sizeof url, "http://127.0.0.1:%d/files/", ntohs(addr.sin_port));
 
     c = test_client(url);
-    c->stall_timeout = 1;
+    c->transport_userdata = &stall_1s;
     ck_assert_int_eq(vectus_upload_create(&u, source_read, NULL, &source, 5), VECTUS_OK);
     start = time(NULL);
     ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_ERR_TRANSPORT);
@@ -643,7 +661,6 @@ START_TEST(test_null_handles)
 
     ck_assert_int_eq(vectus_client_set_header(NULL, "X-A", "1"), VECTUS_ERR_INVALID);
     vectus_client_set_method_override(NULL, 1);
-    vectus_client_set_curl_callback(NULL, set_user_agent, NULL);
     ck_assert_int_eq(vectus_client_discover(NULL), VECTUS_ERR_INVALID);
     ck_assert_uint_eq(vectus_client_extensions(NULL), 0);
     ck_assert(vectus_client_max_size(NULL) == 0);
@@ -985,9 +1002,9 @@ START_TEST(test_upload_fake_concatenation)
     ck_assert_str_eq(vectus_upload_url(u), url);
     ck_assert(vectus_upload_offset(u) == 0);
     ck_assert_int_eq(count(seen, "POST /files/ HTTP/1.1\r\n"), 1);
-    ck_assert_int_eq(count(seen, "Upload-Concat: final;/files/a /files/b\r\n"), 1);
+    ck_assert_int_eq(count(seen, "final;/files/a /files/b\r\n"), 1);
     ck_assert_int_eq(count(seen, "Upload-Concat"), 1);
-    ck_assert_int_eq(count(seen, "Upload-Metadata: filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==\r\n"), 1);
+    ck_assert_int_eq(count(seen, "filename d29ybGRfZG9taW5hdGlvbl9wbGFuLnBkZg==\r\n"), 1);
     ck_assert_int_eq(count(seen, "Upload-Length"), 0);  /* the server sums it up */
     ck_assert_int_eq(count(seen, "Upload-Defer-Length"), 0);
     ck_assert_int_eq(count(seen, "PATCH"), 0);
@@ -1127,7 +1144,7 @@ START_TEST(test_upload_fake_bodies_discarded)
     fflush(stdout);
     saved_stdout = dup(STDOUT_FILENO);
     dup2(fileno(captured), STDOUT_FILENO);
-    init_code = vectus_client_create(&c, server.url);
+    init_code = vectus_client_create(&c, server.url, vectus_curl_transport(), NULL);
     if (init_code == VECTUS_OK && vectus_upload_create(&u, source_read, NULL, &source, 5) == VECTUS_OK) {  /* asks OPTIONS first */
         code = vectus_upload_perform(c, u);
     }
@@ -1310,7 +1327,7 @@ START_TEST(test_client_fake_discover)
     const char *seen;
 
     fake_server_start(&server, responses);
-    ck_assert_int_eq(vectus_client_create(&c, server.url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, server.url, vectus_curl_transport(), NULL), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, "Authorization", "Bearer t"), VECTUS_OK);
 
     ck_assert_int_eq(vectus_client_discover(c), VECTUS_OK);
@@ -1352,7 +1369,7 @@ START_TEST(test_upload_fake_auth_refresh)
 
     source.text = "hello";
     fake_server_start(&server, responses);
-    ck_assert_int_eq(vectus_client_create(&c, server.url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, server.url, vectus_curl_transport(), NULL), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, "Authorization", "Bearer expired"), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, 5), VECTUS_OK);
 
@@ -1392,14 +1409,14 @@ START_TEST(test_upload_fake_headers_everywhere)
     vectus_upload u;
     const char *seen;
     int calls = 0;
+    struct vectus_curl_options options = {set_user_agent, &calls};
     size_t i;
 
     source.text = "hello";
     fake_server_start(&server, responses);
-    ck_assert_int_eq(vectus_client_create(&c, server.url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, server.url, vectus_curl_transport(), &options), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, "X-Custom", "1"), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, "X-Empty", ""), VECTUS_OK);
-    vectus_client_set_curl_callback(c, set_user_agent, &calls);
     ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, 5), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_perform(c, u), VECTUS_OK);                      /* OPTIONS, POST, PATCH */
     ck_assert_int_eq(vectus_upload_set_url(u, vectus_upload_url(u)), VECTUS_OK);
@@ -1432,7 +1449,7 @@ START_TEST(test_upload_fake_resume_without_discovery)
 
     source.text = "hello";
     fake_server_start(&server, responses);
-    ck_assert_int_eq(vectus_client_create(&c, server.url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, server.url, vectus_curl_transport(), NULL), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, 5), VECTUS_OK);
     snprintf(url, sizeof url, "http://127.0.0.1:%d/files/abc", server.port);
     ck_assert_int_eq(vectus_upload_set_url(u, url), VECTUS_OK);
@@ -1673,7 +1690,7 @@ static void assert_uploaded(const char *url, unsigned long long length) {
 static vectus_client live_client(const char *variable) {
     vectus_client c;
 
-    ck_assert_int_eq(vectus_client_create(&c, getenv(variable)), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, getenv(variable), vectus_curl_transport(), NULL), VECTUS_OK);
     ck_assert_msg(vectus_client_discover(c) == VECTUS_OK, "%s", vectus_client_error(c));
     return c;
 }
@@ -1946,7 +1963,7 @@ START_TEST(test_upload_live_file)
     vectus_upload u;
 
     /* Not discovered beforehand: creating asks the server on the way */
-    ck_assert_int_eq(vectus_client_create(&c, getenv("VECTUS_TEST_URL")), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, getenv("VECTUS_TEST_URL"), vectus_curl_transport(), NULL), VECTUS_OK);
     temp_file(path, sizeof path, 4 * MIB + 3);
     ck_assert_int_eq(vectus_upload_create_file(&u, path), VECTUS_OK);
     ck_assert_int_eq(vectus_upload_add_metadata(u, "filename", "test.bin"), VECTUS_OK);

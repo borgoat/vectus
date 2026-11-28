@@ -15,12 +15,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(VECTUS_WARNINGS -Wall -Wextra -Wpedantic)
 endif()
 
-add_library(vectus src/client.c src/upload.c)
+add_library(vectus src/client.c src/upload.c src/curl.c)
 add_library(vectus::vectus ALIAS vectus)
 target_include_directories(vectus PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vectus PRIVATE CURL::libcurl)  # the public headers don't include curl
+target_link_libraries(vectus PUBLIC CURL::libcurl)  # vectus/curl.h includes curl's header
 target_compile_options(vectus PRIVATE ${VECTUS_WARNINGS})
 
 install(TARGETS vectus EXPORT vectusTargets)

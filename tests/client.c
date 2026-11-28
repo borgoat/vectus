@@ -1,15 +1,16 @@
 #include <check.h>
 
-/* client.c to access shadowed fields */
+/* client.c and curl.c to access shadowed fields */
 #include "../src/client.c"
+#include "../src/curl.c"
 
-/* Hand one header line to the callback the way curl does: not NUL-terminated, in an exact-size buffer so ASan sees overruns */
+/* Hand one header line to the client the way curl does: not NUL-terminated, in an exact-size buffer so ASan sees overruns */
 static void feed_header(vectus_client c, const char *line) {
     size_t len = strlen(line);
     char *buffer = malloc(len);
 
     memcpy(buffer, line, len);
-    ck_assert_uint_eq(client_init_header_callback(buffer, 1, len, c), len);
+    ck_assert_uint_eq(easy_parse_header_line(buffer, len, client_handle_header, c), len);
     free(buffer);
 }
 
@@ -117,7 +118,7 @@ START_TEST(test_client_discover_unreachable)
 {
     vectus_client c;
 
-    ck_assert_int_eq(vectus_client_create(&c, "http://127.0.0.1:1/"), VECTUS_OK);  /* nothing listens on port 1, but nothing asks yet */
+    ck_assert_int_eq(vectus_client_create(&c, "http://127.0.0.1:1/", vectus_curl_transport(), NULL), VECTUS_OK);  /* nothing listens on port 1, but nothing asks yet */
     ck_assert_str_eq(vectus_client_error(c), "");
     ck_assert_int_eq(vectus_client_discover(c), VECTUS_ERR_TRANSPORT);
     ck_assert_msg(strncmp(vectus_client_error(c), "OPTIONS: ", 9) == 0 && strlen(vectus_client_error(c)) > 9, "%s", vectus_client_error(c));
@@ -133,7 +134,7 @@ START_TEST(test_client_discover)
     const char *url = getenv("VECTUS_TEST_URL");
     vectus_client c;
 
-    ck_assert_int_eq(vectus_client_create(&c, url), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, url, vectus_curl_transport(), NULL), VECTUS_OK);
     ck_assert_int_eq(vectus_client_discover(c), VECTUS_OK);
     ck_assert_str_eq(c->url, url);
     ck_assert(c->extensions & VECTUS_EXT_CREATION);
@@ -150,16 +151,19 @@ START_TEST(test_client_create)
     vectus_client c = (vectus_client) &c;  /* any non-NULL value, to check create resets it */
     size_t i;
 
-    ck_assert_int_eq(vectus_client_create(NULL, "http://h/files/"), VECTUS_ERR_INVALID);
-    ck_assert_int_eq(vectus_client_create(&c, NULL), VECTUS_ERR_INVALID);
+    ck_assert_int_eq(vectus_client_create(NULL, "http://h/files/", vectus_curl_transport(), NULL), VECTUS_ERR_INVALID);
+    ck_assert_int_eq(vectus_client_create(&c, NULL, vectus_curl_transport(), NULL), VECTUS_ERR_INVALID);
+    ck_assert_ptr_null(c);
+    c = (vectus_client) &c;
+    ck_assert_int_eq(vectus_client_create(&c, "http://h/files/", NULL, NULL), VECTUS_ERR_INVALID);
     ck_assert_ptr_null(c);
     for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
         c = (vectus_client) &c;
-        ck_assert_msg(vectus_client_create(&c, invalid[i]) == VECTUS_ERR_INVALID, "case %zu", i);
+        ck_assert_msg(vectus_client_create(&c, invalid[i], vectus_curl_transport(), NULL) == VECTUS_ERR_INVALID, "case %zu", i);
         ck_assert_ptr_null(c);
     }
 
-    ck_assert_int_eq(vectus_client_create(&c, "HTTPS://h:8443/files/"), VECTUS_OK);  /* schemes are case-insensitive */
+    ck_assert_int_eq(vectus_client_create(&c, "HTTPS://h:8443/files/", vectus_curl_transport(), NULL), VECTUS_OK);  /* schemes are case-insensitive */
     ck_assert_str_eq(c->url, "HTTPS://h:8443/files/");
     ck_assert(!c->discovered);  /* nothing asked yet */
     ck_assert_uint_eq(vectus_client_extensions(c), 0);
@@ -170,14 +174,16 @@ START_TEST(test_client_create)
 }
 END_TEST
 
-/* The client's headers, each followed by a newline */
+/* The client's headers as "Name: value", each followed by a newline */
 static const char *client_headers(vectus_client c) {
     static char joined[512];
-    struct curl_slist *h;
+    size_t i;
 
     joined[0] = '\0';
-    for (h = c->headers; h != NULL; h = h->next) {
-        strcat(joined, h->data);
+    for (i = 0; c->headers != NULL && c->headers[i] != NULL; i += 2) {
+        strcat(joined, c->headers[i]);
+        strcat(joined, ": ");
+        strcat(joined, c->headers[i + 1]);
         strcat(joined, "\n");
     }
     return joined;
@@ -194,7 +200,7 @@ START_TEST(test_client_set_header)
     vectus_client c;
     size_t i;
 
-    ck_assert_int_eq(vectus_client_create(&c, "http://h/files/"), VECTUS_OK);
+    ck_assert_int_eq(vectus_client_create(&c, "http://h/files/", vectus_curl_transport(), NULL), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, NULL, "1"), VECTUS_ERR_INVALID);
     for (i = 0; i < sizeof invalid_names / sizeof invalid_names[0]; i++) {
         ck_assert_msg(vectus_client_set_header(c, invalid_names[i], "1") == VECTUS_ERR_INVALID, "name %zu", i);
@@ -209,11 +215,11 @@ START_TEST(test_client_set_header)
     ck_assert_int_eq(vectus_client_set_header(c, "X-AB", "kept"), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, "X-Empty", ""), VECTUS_OK);
     ck_assert_int_eq(vectus_client_set_header(c, "authorization", "Bearer new"), VECTUS_OK);  /* replaces, whatever the case */
-    ck_assert_str_eq(client_headers(c), "X-A: tab\tand caf\xc3\xa9\nX-AB: kept\nX-Empty;\nauthorization: Bearer new\n");
+    ck_assert_str_eq(client_headers(c), "X-A: tab\tand caf\xc3\xa9\nX-AB: kept\nX-Empty: \nauthorization: Bearer new\n");
 
     ck_assert_int_eq(vectus_client_set_header(c, "X-A", NULL), VECTUS_OK);  /* not X-AB, which starts the same */
     ck_assert_int_eq(vectus_client_set_header(c, "X-Missing", NULL), VECTUS_OK);
-    ck_assert_str_eq(client_headers(c), "X-AB: kept\nX-Empty;\nauthorization: Bearer new\n");
+    ck_assert_str_eq(client_headers(c), "X-AB: kept\nX-Empty: \nauthorization: Bearer new\n");
     vectus_client_cleanup(c);  /* and its headers */
 }
 END_TEST
