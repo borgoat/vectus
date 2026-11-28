@@ -103,6 +103,72 @@ START_TEST(test_offers_tus_1_0_0)
 }
 END_TEST
 
+START_TEST(test_resolve_url)
+{
+    /* RFC 3986 section 5.4, which resolves these against http://a/b/c/d;p?q, minus fragments, which vectus drops */
+    const char *cases[][2] = {
+        {"g", "http://a/b/c/g"}, {"./g", "http://a/b/c/g"}, {"g/", "http://a/b/c/g/"}, {"/g", "http://a/g"},
+        {"//g", "http://g"}, {"?y", "http://a/b/c/d;p?y"}, {"g?y", "http://a/b/c/g?y"}, {"g#s", "http://a/b/c/g"},
+        {";x", "http://a/b/c/;x"}, {"g;x", "http://a/b/c/g;x"}, {".", "http://a/b/c/"}, {"./", "http://a/b/c/"},
+        {"..", "http://a/b/"}, {"../", "http://a/b/"}, {"../g", "http://a/b/g"}, {"../..", "http://a/"},
+        {"../../", "http://a/"}, {"../../g", "http://a/g"},
+        {"../../../g", "http://a/g"}, {"../../../../g", "http://a/g"}, {"/./g", "http://a/g"}, {"/../g", "http://a/g"},
+        {"g.", "http://a/b/c/g."}, {".g", "http://a/b/c/.g"}, {"g..", "http://a/b/c/g.."}, {"..g", "http://a/b/c/..g"},
+        {"./../g", "http://a/b/g"}, {"./g/.", "http://a/b/c/g/"}, {"g/./h", "http://a/b/c/g/h"}, {"g/../h", "http://a/b/c/h"},
+        {"g;x=1/./y", "http://a/b/c/g;x=1/y"}, {"g;x=1/../y", "http://a/b/c/y"}, {"g?y/./x", "http://a/b/c/g?y/./x"},
+        {"g?y/../x", "http://a/b/c/g?y/../x"},
+        /* absolute ones, as tusd answers */
+        {"https://other:8443/files/x/../y?z#f", "https://other:8443/files/y?z"}, {"HTTP://h", "HTTP://h"},
+        {"http://user@[::1]:8080/f", "http://user@[::1]:8080/f"},
+    };
+    const char *invalid[] = {
+        "", "#s", "g:h", "ftp://h/x", "http:g", "http://", "http:///x", "http://user@/x", "http://:80/x", "http://[::1",
+        "http://[]/x", "http://h]/x", "g h", "g\r\nX-Injected: 1", "g\x7f", "caf\xc3\xa9",
+    };
+    char *resolved;
+    size_t i;
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        ck_assert_msg(vectus_resolve_url("http://a/b/c/d;p?q", cases[i][0], &resolved) == VECTUS_OK, "%s", cases[i][0]);
+        ck_assert_msg(strcmp(resolved, cases[i][1]) == 0, "%s resolved to %s", cases[i][0], resolved);
+        free(resolved);
+    }
+    for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        resolved = (char *) invalid;
+        ck_assert_msg(vectus_resolve_url("http://a/b/c/d;p?q", invalid[i], &resolved) == VECTUS_ERR_INVALID, "case %zu", i);
+        ck_assert_ptr_eq(resolved, (char *) invalid);  /* untouched */
+    }
+
+    /* A base without a path, and a relative reference against one */
+    ck_assert_int_eq(vectus_resolve_url("http://h:1", "abc", &resolved), VECTUS_OK);
+    ck_assert_str_eq(resolved, "http://h:1/abc");
+    free(resolved);
+}
+END_TEST
+
+START_TEST(test_parse_http_date)
+{
+    const char *invalid[] = {
+        "", "soon", "Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994", "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Sun, 06 Nov 1994 08:49:37 GMT ", "Sun, 06 Nov 1994 08:49:37", "Sun, 06 Nob 1994 08:49:37 GMT",
+        "Sun, 06 ovN 1994 08:49:37 GMT", "Sun, 32 Nov 1994 08:49:37 GMT", "Sun, 00 Nov 1994 08:49:37 GMT",
+        "Sun, 06 Nov 1994 24:00:00 GMT", "Sun, 06 Nov 1994 08:60:00 GMT", "Sun, 06 Nov 1969 08:49:37 GMT",
+        "Sun, 06 Nov 1994 -8:49:37 GMT",
+    };
+    size_t i;
+
+    ck_assert(vectus_parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT") == 784111777LL);  /* RFC 9110's example */
+    ck_assert(vectus_parse_http_date("Wed, 25 Jun 2014 16:00:00 GMT") == 1403712000LL);  /* the tus spec's */
+    ck_assert(vectus_parse_http_date("Fri, 31 Dec 1999 23:59:59 GMT") == 946684799LL);
+    ck_assert(vectus_parse_http_date("Tue, 29 Feb 2028 12:00:00 GMT") == 1835438400LL);
+    ck_assert(vectus_parse_http_date("Thu, 01 Jan 2071 00:00:00 GMT") == 3187296000LL);  /* past 32-bit time_t */
+    ck_assert(vectus_parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT") == 0);
+    for (i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        ck_assert_msg(vectus_parse_http_date(invalid[i]) == -1, "%s", invalid[i]);
+    }
+}
+END_TEST
+
 START_TEST(test_strerror)
 {
     vectus_code code;
@@ -147,7 +213,7 @@ END_TEST
 
 START_TEST(test_client_create)
 {
-    const char *invalid[] = {"", "not a url", "/files/", "http://", "ftp://h/files/", "file:///tmp/files/"};
+    const char *invalid[] = {"", "not a url", "/files/", "http://", "ftp://h/files/", "file:///tmp/files/", "http://h/files/\r\nX: 1"};
     vectus_client c = (vectus_client) &c;  /* any non-NULL value, to check create resets it */
     size_t i;
 
@@ -163,8 +229,8 @@ START_TEST(test_client_create)
         ck_assert_ptr_null(c);
     }
 
-    ck_assert_int_eq(vectus_client_create(&c, "HTTPS://h:8443/files/", vectus_curl_transport(), NULL), VECTUS_OK);  /* schemes are case-insensitive */
-    ck_assert_str_eq(c->url, "HTTPS://h:8443/files/");
+    ck_assert_int_eq(vectus_client_create(&c, "HTTPS://h:8443/files/#top", vectus_curl_transport(), NULL), VECTUS_OK);  /* schemes are case-insensitive */
+    ck_assert_str_eq(c->url, "HTTPS://h:8443/files/");  /* without the fragment, which stays with the client */
     ck_assert(!c->discovered);  /* nothing asked yet */
     ck_assert_uint_eq(vectus_client_extensions(c), 0);
     ck_assert(vectus_client_max_size(c) == 0);

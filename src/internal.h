@@ -82,6 +82,33 @@ struct vectus_connection {
 };
 
 /**
+ * Whether the first n bytes of a and b match, ignoring the case of ASCII letters, as HTTP compares header names
+ */
+int vectus_strnequal(const char *a, const char *b, size_t n);
+
+/**
+ * Whether a and b match, ignoring the case of ASCII letters
+ */
+#define vectus_strequal(a, b) vectus_strnequal((a), (b), (size_t) -1)
+
+/**
+ * Resolve a URL reference, such as a Location header, against base, as RFC 3986 section 5.2 does, dropping any fragment
+ *
+ * @param base an absolute URL, or reference itself to check that it is one
+ * @param resolved set to the absolute URL, to be freed, on success
+ * @return VECTUS_OK, VECTUS_ERR_INVALID for anything but an http or https URL with a host, or a reference with spaces,
+ *         control characters or other bytes outside printable ASCII, or VECTUS_ERR_MEMORY
+ */
+vectus_code vectus_resolve_url(const char *base, const char *reference, char **resolved);
+
+/**
+ * Parse an HTTP date, such as "Sun, 06 Nov 1994 08:49:37 GMT"
+ *
+ * @return seconds since the epoch, or -1 if value is not a date
+ */
+long long vectus_parse_http_date(const char *value);
+
+/**
  * Parse a header value made only of digits, such as Tus-Max-Size
  *
  * @return 1 with the value stored in size, or 0 leaving size alone for anything else, including a sign or a value too large

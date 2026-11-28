@@ -378,24 +378,6 @@ START_TEST(test_upload_headers)
 }
 END_TEST
 
-START_TEST(test_upload_resolve_url)
-{
-    const char *cases[][2] = {
-        {"/files/abc", "http://h:1/files/abc"},
-        {"abc", "http://h:1/files/abc"},
-        {"https://other/x", "https://other/x"},
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        char *resolved = upload_resolve_url("http://h:1/files/", cases[i][0]);
-
-        ck_assert_str_eq(resolved, cases[i][1]);
-        free(resolved);
-    }
-}
-END_TEST
-
 /* Read through the wrapper the transport calls */
 static size_t read_through(vectus_upload u, char *buffer, size_t size) {
     struct upload_exchange exchange = {u, NULL};

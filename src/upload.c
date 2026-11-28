@@ -11,7 +11,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include <curl/curl.h>
 #include <vectus/vectus.h>
 
 #include "internal.h"
@@ -151,21 +150,21 @@ struct upload_exchange {
 static void upload_handle_header(void *userdata, const char *name, const char *value) {
     struct upload_response *response = ((struct upload_exchange *) userdata)->response;
 
-    if (curl_strequal(name, "Location")) {
+    if (vectus_strequal(name, "Location")) {
         free(response->location);
         response->location = malloc(strlen(value) + 1);
         if (response->location != NULL) strcpy(response->location, value);
         else response->out_of_memory = 1;
-    } else if (curl_strequal(name, "Upload-Offset")) {
+    } else if (vectus_strequal(name, "Upload-Offset")) {
         response->has_offset = vectus_parse_size(value, &response->offset);
-    } else if (curl_strequal(name, "Upload-Length")) {
+    } else if (vectus_strequal(name, "Upload-Length")) {
         response->has_length = vectus_parse_size(value, &response->length);
-    } else if (curl_strequal(name, "Upload-Defer-Length")) {
+    } else if (vectus_strequal(name, "Upload-Defer-Length")) {
         response->length_deferred = strcmp(value, "1") == 0;
-    } else if (curl_strequal(name, "Upload-Expires")) {
-        time_t expires = curl_getdate(value, NULL);  /* -1 when it is not a date */
+    } else if (vectus_strequal(name, "Upload-Expires")) {
+        long long expires = vectus_parse_http_date(value);  /* -1 when it is not a date */
 
-        if (expires > 0) response->expires = expires;
+        if (expires > 0 && (long long) (time_t) expires == expires) response->expires = (time_t) expires;
     }
 }
 
@@ -353,27 +352,6 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
 }
 
 /**
- * Resolve a Location header, which may be relative, against the URL the request went to
- *
- * @return the absolute URL, to be freed, or NULL if it cannot be resolved
- */
-static char *upload_resolve_url(const char *base, const char *location) {
-    CURLU *u = curl_url();
-    char *resolved = NULL;
-    char *copy = NULL;
-
-    if (u != NULL && curl_url_set(u, CURLUPART_URL, base, 0) == CURLUE_OK
-        && curl_url_set(u, CURLUPART_URL, location, 0) == CURLUE_OK
-        && curl_url_get(u, CURLUPART_URL, &resolved, 0) == CURLUE_OK) {
-        copy = malloc(strlen(resolved) + 1);
-        if (copy != NULL) strcpy(copy, resolved);
-    }
-    curl_free(resolved);
-    curl_url_cleanup(u);
-    return copy;
-}
-
-/**
  * The statuses tus servers answer for an upload that no longer exists
  */
 static int upload_gone(long status) {
@@ -400,11 +378,14 @@ static vectus_code upload_create_remote(vectus_client client, vectus_upload uplo
     } else if (response.location == NULL) {
         code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "POST answered 201 without a Location header");
     } else {
-        upload->url = upload_resolve_url(client->url, response.location);
+        vectus_code resolved = vectus_resolve_url(client->url, response.location, &upload->url);  /* it may be relative */
+
         upload->offset = 0;
         upload->expires = response.expires;
         upload->length_declared = upload->length != VECTUS_LENGTH_UNKNOWN;
-        if (upload->url == NULL) {
+        if (resolved == VECTUS_ERR_MEMORY) {
+            code = upload_fail(upload, VECTUS_ERR_MEMORY, "POST: out of memory");
+        } else if (resolved != VECTUS_OK) {
             code = upload_fail(upload, VECTUS_ERR_PROTOCOL, "POST answered a Location header that is not a URL");
         } else if (with_data && (!response.has_offset || response.offset > upload->length)) {
             /* the URL stays, so the next perform asks the server what it kept */

@@ -9,45 +9,59 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-find_package(CURL REQUIRED)
+option(VECTUS_CURL "Build the libcurl transport, vectus::curl" ON)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set(VECTUS_WARNINGS -Wall -Wextra -Wpedantic)
 endif()
 
-add_library(vectus src/client.c src/upload.c src/curl.c)
+# The core needs only the C library; transports bring the HTTP client
+add_library(vectus src/client.c src/upload.c)
 add_library(vectus::vectus ALIAS vectus)
 target_include_directories(vectus PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vectus PUBLIC CURL::libcurl)  # vectus/curl.h includes curl's header
 target_compile_options(vectus PRIVATE ${VECTUS_WARNINGS})
-
 install(TARGETS vectus EXPORT vectusTargets)
-install(DIRECTORY include/vectus TYPE INCLUDE)
+install(FILES include/vectus/client.h include/vectus/transport.h include/vectus/vectus.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vectus)
+
+# shortcut: the .pc files bake in the configure-time prefix, so `cmake --install --prefix` elsewhere breaks them; make them relocatable if packagers need that
+configure_file(cmake/vectus.pc.in vectus.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vectus.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+if(VECTUS_CURL)
+    find_package(CURL REQUIRED)
+    add_library(vectus-curl src/curl.c)
+    add_library(vectus::curl ALIAS vectus-curl)
+    set_target_properties(vectus-curl PROPERTIES EXPORT_NAME curl)
+    target_link_libraries(vectus-curl PUBLIC vectus CURL::libcurl)  # vectus/curl.h includes curl's header
+    target_compile_options(vectus-curl PRIVATE ${VECTUS_WARNINGS})
+    install(TARGETS vectus-curl EXPORT vectusTargets)
+    install(FILES include/vectus/curl.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/vectus)
+    configure_file(cmake/vectus-curl.pc.in vectus-curl.pc @ONLY)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vectus-curl.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif()
+
 install(EXPORT vectusTargets NAMESPACE vectus:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vectus)
 write_basic_package_version_file(vectusConfigVersion.cmake COMPATIBILITY SameMinorVersion)
 install(FILES cmake/vectusConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/vectusConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/vectus)
 
-# shortcut: the .pc file bakes in the configure-time prefix, so `cmake --install --prefix` elsewhere breaks it; make it relocatable if packagers need that
-configure_file(cmake/vectus.pc.in vectus.pc @ONLY)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/vectus.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-
-# The example and tests only for the top-level project, so projects embedding vectus don't build them or need Check
-if(PROJECT_IS_TOP_LEVEL)
+# The example and tests only for the top-level project, so projects embedding vectus don't build them or need Check;
+# both use the curl transport
+if(PROJECT_IS_TOP_LEVEL AND VECTUS_CURL)
     include(CTest)
     add_executable(vectus-upload examples/upload.c)
-    target_link_libraries(vectus-upload PRIVATE vectus)
+    target_link_libraries(vectus-upload PRIVATE vectus::curl)
     target_compile_options(vectus-upload PRIVATE ${VECTUS_WARNINGS})
 endif()
 
-if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING)
+if(PROJECT_IS_TOP_LEVEL AND VECTUS_CURL AND BUILD_TESTING)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CHECK REQUIRED IMPORTED_TARGET check)
     find_package(Threads REQUIRED)  # uploads on several threads sharing a client
 
-    # The tests compile src/client.c themselves, so this sanitizes the code under test without touching the installed library
+    # The tests compile src/*.c themselves, so this sanitizes the code under test without touching the installed library
     include(CheckCSourceCompiles)
     set(VECTUS_SANITIZE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
     list(JOIN VECTUS_SANITIZE " " CMAKE_REQUIRED_FLAGS)

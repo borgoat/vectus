@@ -35,7 +35,8 @@ vectus-upload https://tus.example.com/files/ video.mp4
 
 ## Build and install
 
-vectus needs libcurl, and CMake 3.21 or newer to build. The tests also need [Check](https://libcheck.github.io/check/).
+vectus needs only the C and POSIX libraries, and CMake 3.21 or newer to build. Its curl transport needs libcurl; leave it out
+with `-DVECTUS_CURL=OFF`. The tests also need [Check](https://libcheck.github.io/check/).
 
 ```sh
 cmake -B build
@@ -44,7 +45,8 @@ ctest --test-dir build
 cmake --install build
 ```
 
-Then `find_package(vectus)` and link `vectus::vectus` from CMake, or use `pkg-config --cflags --libs vectus`.
+Then `find_package(vectus)` and link `vectus::curl` from CMake, or use `pkg-config --cflags --libs vectus-curl`;
+with a transport of your own, link `vectus::vectus`, or use `pkg-config --cflags --libs vectus`.
 
 ## Using it
 
