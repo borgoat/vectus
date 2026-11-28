@@ -5,6 +5,5 @@ includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 Name: vectus
 Description: @PROJECT_DESCRIPTION@
 Version: @PROJECT_VERSION@
-Requires: libcurl
 Cflags: -I${includedir}
 Libs: -L${libdir} -lvectus

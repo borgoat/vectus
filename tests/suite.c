@@ -22,6 +22,8 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_client, test_client_getters);
     tcase_add_test(tc_client, test_cleanup_without_headers);
     tcase_add_test(tc_client, test_offers_tus_1_0_0);
+    tcase_add_test(tc_client, test_resolve_url);
+    tcase_add_test(tc_client, test_parse_http_date);
     tcase_add_test(tc_client, test_strerror);
     tcase_add_test(tc_client, test_client_create);
     tcase_add_test(tc_client, test_client_set_header);
@@ -36,7 +38,6 @@ Suite *vectus_suite(void) {
     tcase_add_test(tc_upload, test_null_handles);
     tcase_add_test(tc_upload, test_upload_create_file);
     tcase_add_test(tc_upload, test_upload_headers);
-    tcase_add_test(tc_upload, test_upload_resolve_url);
     tcase_add_test(tc_upload, test_upload_read_wrapper);
     tcase_add_test(tc_upload, test_upload_create_and_urls);
     tcase_add_test(tc_upload, test_upload_too_large_for_server);

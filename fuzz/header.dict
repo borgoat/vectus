@@ -1,4 +1,4 @@
-# Header names are compared inside libcurl, which libFuzzer cannot see into, so spell them out
+# Header names, compared a character at a time, which libFuzzer is slow to guess, and pieces of URLs and dates
 "Tus-Version:"
 "tus-version:"
 "Tus-Extension:"
@@ -22,3 +22,16 @@
 " "
 "\x09"
 "\x0d\x0a"
+"http://"
+"https://"
+"//"
+"../"
+"./"
+"/../"
+"?"
+"#"
+"@"
+":"
+"[::1]"
+" GMT"
+"Nov"

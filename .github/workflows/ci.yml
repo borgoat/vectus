@@ -36,6 +36,11 @@ jobs:
         run: grep -q '^VECTUS_HAVE_SANITIZERS:INTERNAL=1$' build/CMakeCache.txt
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
+      - name: Build the core alone, which must not need libcurl
+        run: |
+          cmake -B build-core -DVECTUS_CURL=OFF -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+          cmake --build build-core
+          if nm -u build-core/libvectus.a | grep -i curl; then exit 1; fi
 
   e2e:
     runs-on: ubuntu-24.04

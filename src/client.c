@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <curl/curl.h>
 #include <vectus/client.h>
 
 #include "internal.h"
@@ -19,6 +18,233 @@ static char *client_copy(const char *s) {
 
     if (copy != NULL) strcpy(copy, s);
     return copy;
+}
+
+static int ascii_lower(unsigned char c) {
+    return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+}
+
+int vectus_strnequal(const char *a, const char *b, size_t n) {
+    for (; n > 0; a++, b++, n--) {
+        if (ascii_lower((unsigned char) *a) != ascii_lower((unsigned char) *b)) return 0;
+        if (*a == '\0') return 1;
+    }
+    return 1;
+}
+
+/**
+ * A URL or reference split into the parts of RFC 3986 appendix B, with the fragment cut off; a part is absent when NULL
+ */
+struct url_parts {
+    const char *scheme;
+    size_t scheme_len;
+    const char *authority;
+    size_t authority_len;
+    const char *path;  /* never absent, but possibly empty */
+    size_t path_len;
+    const char *query;  /* with its '?' */
+    size_t query_len;
+};
+
+/**
+ * How many of the len bytes at s come before one of stops
+ */
+static size_t url_span(const char *s, size_t len, const char *stops) {
+    size_t i = 0;
+
+    while (i < len && strchr(stops, s[i]) == NULL) i++;
+    return i;
+}
+
+static void url_split(const char *s, size_t len, struct url_parts *p) {
+    size_t i = url_span(s, len, ":/?");
+
+    memset(p, 0, sizeof *p);
+    /* A scheme is a letter, then letters, digits, "+", "-" or ".", then a colon; "a:b" without one is a path */
+    if (i > 0 && i < len && s[i] == ':' && ascii_lower((unsigned char) s[0]) >= 'a' && ascii_lower((unsigned char) s[0]) <= 'z'
+        && strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-.") >= i) {
+        p->scheme = s;
+        p->scheme_len = i;
+        s += i + 1;
+        len -= i + 1;
+    }
+    if (len >= 2 && s[0] == '/' && s[1] == '/') {
+        p->authority = s + 2;
+        p->authority_len = url_span(s + 2, len - 2, "/?");
+        s += 2 + p->authority_len;
+        len -= 2 + p->authority_len;
+    }
+    p->path = s;
+    p->path_len = url_span(s, len, "?");
+    if (p->path_len < len) {
+        p->query = s + p->path_len;
+        p->query_len = len - p->path_len;
+    }
+}
+
+/**
+ * Whether an authority, such as "user@host:8080" or "[::1]:8080", has a host, an IPv6 one within brackets
+ */
+static int url_has_host(const char *authority, size_t len) {
+    const char *host = authority;
+    const char *close;
+    size_t i;
+
+    for (i = len; i > 0; i--) {
+        if (authority[i - 1] == '@') {
+            host = authority + i;  /* after the user information */
+            break;
+        }
+    }
+    len -= (size_t) (host - authority);
+    if (len > 0 && host[0] == '[') {
+        close = memchr(host, ']', len);
+        return close != NULL && close > host + 1 && (close + 1 == host + len || close[1] == ':');
+    }
+    return len > 0 && host[0] != ':' && memchr(host, '[', len) == NULL && memchr(host, ']', len) == NULL;
+}
+
+/**
+ * Remove the "." and ".." segments from the len bytes of path, in place, as RFC 3986 section 5.2.4 does
+ *
+ * @return the new length, never more than len
+ */
+static size_t url_remove_dots(char *path, size_t len) {
+    const char *in = path;
+    const char *end = path + len;
+    size_t out = 0;  /* path[out] never passes in, so the output can overwrite what was already read */
+
+    while (in < end) {
+        size_t left = (size_t) (end - in);
+
+        if (left >= 3 && memcmp(in, "../", 3) == 0) {
+            in += 3;
+        } else if (left >= 2 && memcmp(in, "./", 2) == 0) {
+            in += 2;
+        } else if (left >= 3 && memcmp(in, "/./", 3) == 0) {
+            in += 2;
+        } else if (left == 2 && memcmp(in, "/.", 2) == 0) {
+            path[out++] = '/';
+            in = end;
+        } else if (left >= 4 && memcmp(in, "/../", 4) == 0) {
+            in += 3;
+            while (out > 0 && path[--out] != '/') {}  /* drop the last segment written */
+        } else if (left == 3 && memcmp(in, "/..", 3) == 0) {
+            while (out > 0 && path[--out] != '/') {}
+            path[out++] = '/';
+            in = end;
+        } else if ((left == 1 && in[0] == '.') || (left == 2 && memcmp(in, "..", 2) == 0)) {
+            in = end;
+        } else {
+            do path[out++] = *in++; while (in < end && *in != '/');  /* the next segment, with the '/' before it */
+        }
+    }
+    return out;
+}
+
+vectus_code vectus_resolve_url(const char *base, const char *reference, char **resolved) {
+    struct url_parts b;
+    struct url_parts r;
+    struct url_parts t;
+    size_t length = strcspn(reference, "#");  /* fragments stay with the client */
+    int merge;
+    char *url;
+    char *path;
+    size_t n = 0;
+    size_t i;
+
+    /* Anything else could break the request line it goes into */
+    for (i = 0; i < length; i++) {
+        if ((unsigned char) reference[i] <= ' ' || (unsigned char) reference[i] > '~') return VECTUS_ERR_INVALID;
+    }
+    if (length == 0) {
+        return VECTUS_ERR_INVALID;
+    }
+    url_split(base, strcspn(base, "#"), &b);
+    url_split(reference, length, &r);
+
+    t = r;
+    merge = r.scheme == NULL && r.authority == NULL && r.path_len > 0 && r.path[0] != '/';
+    if (r.scheme == NULL) {
+        t.scheme = b.scheme;
+        t.scheme_len = b.scheme_len;
+        if (r.authority == NULL) {
+            t.authority = b.authority;
+            t.authority_len = b.authority_len;
+        }
+        if (r.authority == NULL && r.path_len == 0) {
+            t.path = b.path;
+            t.path_len = b.path_len;
+            if (r.query == NULL) {
+                t.query = b.query;
+                t.query_len = b.query_len;
+            }
+        }
+    }
+    if (t.scheme == NULL || !((t.scheme_len == 4 && vectus_strnequal(t.scheme, "http", 4)) || (t.scheme_len == 5 && vectus_strnequal(t.scheme, "https", 5)))
+        || t.authority == NULL || !url_has_host(t.authority, t.authority_len)) {
+        return VECTUS_ERR_INVALID;
+    }
+
+    url = malloc(t.scheme_len + 3 + t.authority_len + b.path_len + 1 + t.path_len + t.query_len + 1);
+    if (url == NULL) {
+        return VECTUS_ERR_MEMORY;
+    }
+    memcpy(url, t.scheme, t.scheme_len);
+    n += t.scheme_len;
+    memcpy(url + n, "://", 3);
+    n += 3;
+    memcpy(url + n, t.authority, t.authority_len);
+    n += t.authority_len;
+    path = url + n;
+    if (merge) {
+        size_t dir = b.path_len;  /* the base's path up to its last '/', or "/" for an empty one */
+
+        while (dir > 0 && b.path[dir - 1] != '/') dir--;
+        if (b.path_len == 0) url[n++] = '/';
+        memcpy(url + n, b.path, dir);
+        n += dir;
+    }
+    memcpy(url + n, t.path, t.path_len);
+    n += t.path_len;
+    n = (size_t) (path - url) + url_remove_dots(path, (size_t) (url + n - path));
+    if (t.query != NULL) memcpy(url + n, t.query, t.query_len);
+    n += t.query_len;
+    url[n] = '\0';
+    *resolved = url;
+    return VECTUS_OK;
+}
+
+long long vectus_parse_http_date(const char *value) {
+    /* shortcut: only the IMF-fixdate format, which tus servers send; RFC 9110 also asks to accept the obsolete RFC 850 and asctime ones, add them if a server sends those */
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char weekday[4];
+    char month[4];
+    int day;
+    int year;
+    int hour;
+    int minute;
+    int second;
+    int end = 0;
+    const char *found;
+    long long m;
+    long long y;
+    long long days;
+
+    if (sscanf(value, "%3s, %2d %3s %4d %2d:%2d:%2d GMT%n", weekday, &day, month, &year, &hour, &minute, &second, &end) != 7
+        || end == 0 || value[end] != '\0') {
+        return -1;
+    }
+    found = strlen(month) == 3 ? strstr(months, month) : NULL;
+    if (found == NULL || (found - months) % 3 != 0 || day < 1 || day > 31 || year < 1970 || hour < 0 || hour > 23
+        || minute < 0 || minute > 59 || second < 0 || second > 60) {
+        return -1;
+    }
+    /* Days since the epoch, as Howard Hinnant's days_from_civil counts them, for years from 1970 */
+    m = (found - months) / 3 + 1;
+    y = year - (m <= 2);
+    days = y * 365 + y / 4 - y / 100 + y / 400 + (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + day - 1 - 719468;
+    return days * 86400 + hour * 3600 + minute * 60 + second;
 }
 
 /**
@@ -76,13 +302,13 @@ static void client_handle_header(void *userdata, const char *name, const char *v
     vectus_client v = userdata;
 
     /* Header names are case-insensitive, and HTTP/2 sends them lowercase */
-    if (curl_strequal(name, "Tus-Version")) {
+    if (vectus_strequal(name, "Tus-Version")) {
         free(v->version);
         v->version = client_copy(value);
         if (v->version == NULL) v->out_of_memory = 1;
-    } else if (curl_strequal(name, "Tus-Extension")) {
+    } else if (vectus_strequal(name, "Tus-Extension")) {
         v->extensions = parse_extensions(value);
-    } else if (curl_strequal(name, "Tus-Max-Size")) {
+    } else if (vectus_strequal(name, "Tus-Max-Size")) {
         vectus_parse_size(value, &v->max_size);  /* an invalid value leaves it at 0, meaning no known limit */
     }
 }
@@ -175,9 +401,8 @@ vectus_code vectus_send(vectus_client client, struct vectus_connection *connecti
 
 vectus_code vectus_client_create(vectus_client *client, const char *url, const struct vectus_transport *transport,
                                  void *transport_userdata) {
-    CURLU *u;
-    char *scheme = NULL;
-    vectus_code code = VECTUS_ERR_MEMORY;
+    char *resolved = NULL;
+    vectus_code code;
 
     if (client == NULL) {
         return VECTUS_ERR_INVALID;
@@ -186,28 +411,19 @@ vectus_code vectus_client_create(vectus_client *client, const char *url, const s
     if (url == NULL || transport == NULL || transport->open == NULL || transport->perform == NULL || transport->close == NULL) {
         return VECTUS_ERR_INVALID;
     }
-    u = curl_url();
-    if (u == NULL) {
+    code = vectus_resolve_url(url, url, &resolved);  /* checks it is an http or https URL, and drops any fragment */
+    if (code != VECTUS_OK) {
+        return code;
+    }
+    *client = calloc(1, sizeof(struct vectus_client_s));  /* zeroed: no headers, nothing discovered */
+    if (*client == NULL) {
+        free(resolved);
         return VECTUS_ERR_MEMORY;
     }
-    if (curl_url_set(u, CURLUPART_URL, url, 0) != CURLUE_OK || curl_url_get(u, CURLUPART_SCHEME, &scheme, 0) != CURLUE_OK
-        || !(curl_strequal(scheme, "http") || curl_strequal(scheme, "https"))) {
-        code = VECTUS_ERR_INVALID;
-    } else {
-        *client = calloc(1, sizeof(struct vectus_client_s));  /* zeroed: no headers, nothing discovered */
-        if (*client != NULL) (*client)->url = client_copy(url);
-        if (*client != NULL && (*client)->url != NULL) {
-            (*client)->transport = transport;
-            (*client)->transport_userdata = transport_userdata;
-            code = VECTUS_OK;
-        } else {
-            vectus_client_cleanup(*client);
-            *client = NULL;
-        }
-    }
-    curl_free(scheme);
-    curl_url_cleanup(u);
-    return code;
+    (*client)->url = resolved;
+    (*client)->transport = transport;
+    (*client)->transport_userdata = transport_userdata;
+    return VECTUS_OK;
 }
 
 /**
@@ -217,11 +433,11 @@ static int header_reserved(const char *name) {
     static const char *const reserved[] = {"Content-Type", "Content-Length", "Transfer-Encoding", "Expect", "X-HTTP-Method-Override"};
     size_t i;
 
-    if (curl_strnequal(name, "Tus-", 4) || curl_strnequal(name, "Upload-", 7)) {
+    if (vectus_strnequal(name, "Tus-", 4) || vectus_strnequal(name, "Upload-", 7)) {
         return 1;
     }
     for (i = 0; i < sizeof reserved / sizeof reserved[0]; i++) {
-        if (curl_strequal(name, reserved[i])) return 1;
+        if (vectus_strequal(name, reserved[i])) return 1;
     }
     return 0;
 }
@@ -260,7 +476,7 @@ vectus_code vectus_client_set_header(vectus_client client, const char *name, con
         return VECTUS_ERR_MEMORY;
     }
     for (i = 0; i < count; i += 2) {
-        if (curl_strequal(client->headers[i], name)) {  /* the header being replaced or removed */
+        if (vectus_strequal(client->headers[i], name)) {  /* the header being replaced or removed */
             free(client->headers[i]);
             free(client->headers[i + 1]);
         } else {

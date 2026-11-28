@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 
 /*
- * libFuzzer target for the response header parsing in src/client.c, src/upload.c and src/curl.c.
+ * libFuzzer target for the parsers of what servers send: response headers (src/client.c, src/upload.c and src/curl.c),
+ * URLs to resolve, such as a Location header, and HTTP dates.
  * Needs clang with libFuzzer (Apple's clang has none: use Linux or Homebrew llvm):
  *
  *   clang -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -Iinclude fuzz/header.c $(pkg-config --cflags --libs libcurl) -o fuzz-header
@@ -20,6 +21,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     struct upload_response response = {0};
     struct upload_exchange exchange = {NULL, &response};
     const uint8_t *end = data + size;
+    char *text = malloc(size + 1);
+    char *resolved;
+
+    /* The whole input as a URL, resolved against a base as a Location is, then on its own as vectus_client_create checks it,
+       and as a date */
+    if (text == NULL) return 0;
+    memcpy(text, data, size);
+    text[size] = '\0';
+    if (vectus_resolve_url("http://h/a/b;p?q", text, &resolved) == VECTUS_OK) free(resolved);
+    if (vectus_resolve_url(text, text, &resolved) == VECTUS_OK) free(resolved);
+    vectus_parse_http_date(text);
+    free(text);
 
     /* Hand the input over line by line like curl does, each line in an exact-size buffer so ASan sees overruns */
     while (data < end) {
