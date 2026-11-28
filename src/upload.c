@@ -17,9 +17,8 @@
 #include "internal.h"
 
 
-/* curl takes the request size as a signed 64-bit curl_off_t, which caps the upload length */
+/* HTTP clients such as curl count bytes in signed 64 bits, which caps the upload length */
 #define UPLOAD_MAX_LENGTH 9223372036854775807ULL
-typedef char upload_curl_off_t_is_64_bits[sizeof(curl_off_t) == 8 ? 1 : -1];
 
 struct vectus_upload_s {
     /**
@@ -73,7 +72,7 @@ struct vectus_upload_s {
     time_t expires;
 
     /**
-     * the whole Upload-Metadata header line sent on creation, NULL until a pair is added
+     * the Upload-Metadata header's value sent on creation, NULL until a pair is added
      */
     char *metadata;
 
@@ -83,7 +82,7 @@ struct vectus_upload_s {
     int partial;
 
     /**
-     * the whole Upload-Concat header line creating a final upload, NULL for any other
+     * the Upload-Concat header's value creating a final upload, NULL for any other
      */
     char *final;
 
@@ -111,7 +110,7 @@ struct vectus_upload_s {
     /**
      * reused for every request, so they can share a connection
      */
-    CURL *curl;
+    struct vectus_connection connection;
 
     /**
      * the HTTP status of the last response, 0 if none came
@@ -141,8 +140,16 @@ struct upload_response {
 
 enum upload_method { UPLOAD_POST, UPLOAD_HEAD, UPLOAD_PATCH, UPLOAD_DELETE };
 
-static void upload_handle_header(void *target, const char *name, char *value) {
-    struct upload_response *response = target;
+/**
+ * One request about the upload, and its response, which the transport's callbacks get as their userdata
+ */
+struct upload_exchange {
+    vectus_upload upload;
+    struct upload_response *response;
+};
+
+static void upload_handle_header(void *userdata, const char *name, const char *value) {
+    struct upload_response *response = ((struct upload_exchange *) userdata)->response;
 
     if (curl_strequal(name, "Location")) {
         free(response->location);
@@ -162,17 +169,12 @@ static void upload_handle_header(void *target, const char *name, char *value) {
     }
 }
 
-static size_t upload_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
-    return vectus_parse_header_line(buffer, size * nitems, upload_handle_header, userdata);
-}
-
 /**
- * Feed curl from the read callback, never past the upload's length, keeping track of the stream position
+ * Feed the transport from the read callback, never past the upload's length, keeping track of the stream position
  */
-static size_t upload_read_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
-    vectus_upload upload = userdata;
+static size_t upload_read(void *userdata, char *buffer, size_t wanted) {
+    vectus_upload upload = ((struct upload_exchange *) userdata)->upload;
     unsigned long long remaining = upload->length - upload->position;
-    size_t wanted = size * nitems;
     size_t bytes;
 
     if (wanted > remaining) wanted = (size_t) remaining;
@@ -193,7 +195,7 @@ static size_t upload_read_callback(char *buffer, size_t size, size_t nitems, voi
         upload->source_failed = "the read callback returned more than asked for";
     }
     if (upload->source_failed != NULL) {
-        return CURL_READFUNC_ABORT;
+        return VECTUS_READ_ABORT;
     }
     upload->position += bytes;
     return bytes;
@@ -202,17 +204,14 @@ static size_t upload_read_callback(char *buffer, size_t size, size_t nitems, voi
 /**
  * Report to the progress callback how far the data has gone, from where the server stood when the request started
  */
-static int upload_progress_callback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
-    vectus_upload upload = clientp;
-    unsigned long long sent = upload->offset + (unsigned long long) ulnow;
+static int upload_progress(void *userdata, unsigned long long sent) {
+    vectus_upload upload = ((struct upload_exchange *) userdata)->upload;
+    unsigned long long offset = upload->offset + sent;
 
-    (void) dltotal;
-    (void) dlnow;
-    (void) ultotal;  /* 0 while sending a stream of unknown length, so the upload's own length says more */
-    if (ulnow > 0 && sent > upload->position) {
-        sent = upload->position;  /* ulnow counts the chunked encoding's framing too, but no more went than was read */
+    if (sent > 0 && offset > upload->position) {
+        offset = upload->position;  /* a transport may count the chunked encoding's framing too, but no more went than was read */
     }
-    if (upload->progress(upload->progress_userdata, sent, upload->length) != 0) {
+    if (upload->progress(upload->progress_userdata, offset, upload->length) != 0) {
         upload->cancelled = 1;
         return 1;
     }
@@ -225,19 +224,6 @@ static int upload_progress_callback(void *clientp, curl_off_t dltotal, curl_off_
 static vectus_code upload_fail(vectus_upload upload, vectus_code code, const char *message) {
     snprintf(upload->error, sizeof upload->error, "%s", message);
     return code;
-}
-
-/**
- * curl_slist_append keeps the list when it fails, so note the failure and carry on with the old list
- */
-static struct curl_slist *upload_add_header(struct curl_slist *headers, const char *header, int *failed) {
-    struct curl_slist *appended = curl_slist_append(headers, header);
-
-    if (appended == NULL) {
-        *failed = 1;
-        return headers;
-    }
-    return appended;
 }
 
 /* shortcut: only uploads up to 1 MiB ride in the creation POST, since bytes sent before the server answers with the URL
@@ -274,20 +260,6 @@ static vectus_code upload_seek(vectus_upload upload) {
 }
 
 /**
- * The upload's curl handle, cleared of the last request's options but keeping its connection open for the next one
- *
- * @return the handle, or NULL out of memory, with the error naming method
- */
-static CURL *upload_handle(vectus_upload upload, const char *method) {
-    if (upload->curl != NULL) {
-        curl_easy_reset(upload->curl);
-    } else if ((upload->curl = curl_easy_init()) == NULL) {
-        snprintf(upload->error, sizeof upload->error, "%s: out of memory", method);
-    }
-    return upload->curl;
-}
-
-/**
  * Send one tus request about the upload and collect what the response says
  *
  * @return VECTUS_OK when a response arrived, whatever its status
@@ -295,94 +267,77 @@ static CURL *upload_handle(vectus_upload upload, const char *method) {
 static vectus_code upload_request(vectus_client client, vectus_upload upload, enum upload_method method, const char *url,
                                   struct upload_response *response) {
     static const char *const names[] = {"POST", "HEAD", "PATCH", "DELETE"};
-    CURL *c;
-    struct curl_slist *headers = NULL;
-    char header[64];
-    int failed = 0;
+    struct upload_exchange exchange;
+    vectus_request request = {0};
+    const char *headers[16];
+    char length[24];
+    char offset[24];
+    size_t n = 0;
     int with_data = method == UPLOAD_PATCH || (method == UPLOAD_POST && upload_creates_with_data(client, upload));
-    vectus_code code = VECTUS_ERR_MEMORY;
+    int overridden = client->method_override && (method == UPLOAD_PATCH || method == UPLOAD_DELETE);
+    vectus_code code;
 
-    c = upload_handle(upload, names[method]);
-    if (c == NULL) {
-        return VECTUS_ERR_MEMORY;
-    }
-
-    headers = upload_add_header(headers, "Tus-Resumable: 1.0.0", &failed);
+    snprintf(length, sizeof length, "%llu", upload->length);
+    snprintf(offset, sizeof offset, "%llu", upload->offset);
+    headers[n++] = "Tus-Resumable";
+    headers[n++] = "1.0.0";
     if (method == UPLOAD_POST) {
         if (upload->final != NULL) {
-            headers = upload_add_header(headers, upload->final, &failed);  /* the server sums up the length */
+            headers[n++] = "Upload-Concat";  /* the server sums up the length */
+            headers[n++] = upload->final;
         } else if (upload->length == VECTUS_LENGTH_UNKNOWN) {
-            headers = upload_add_header(headers, "Upload-Defer-Length: 1", &failed);
+            headers[n++] = "Upload-Defer-Length";
+            headers[n++] = "1";
         } else {
-            snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
-            headers = upload_add_header(headers, header, &failed);
+            headers[n++] = "Upload-Length";
+            headers[n++] = length;
         }
-        if (upload->partial && upload->final == NULL) headers = upload_add_header(headers, "Upload-Concat: partial", &failed);
-        if (upload->metadata != NULL) headers = upload_add_header(headers, upload->metadata, &failed);
+        if (upload->partial && upload->final == NULL) {
+            headers[n++] = "Upload-Concat";
+            headers[n++] = "partial";
+        }
+        if (upload->metadata != NULL) {
+            headers[n++] = "Upload-Metadata";
+            headers[n++] = upload->metadata;
+        }
     } else if (method == UPLOAD_PATCH) {
-        snprintf(header, sizeof header, "Upload-Offset: %llu", upload->offset);
-        headers = upload_add_header(headers, header, &failed);
+        headers[n++] = "Upload-Offset";
+        headers[n++] = offset;
         if (upload_declares_length(upload)) {
-            snprintf(header, sizeof header, "Upload-Length: %llu", upload->length);
-            headers = upload_add_header(headers, header, &failed);
+            headers[n++] = "Upload-Length";
+            headers[n++] = length;
         }
     }
-    if (client->method_override && method == UPLOAD_PATCH) {
-        headers = upload_add_header(headers, "X-HTTP-Method-Override: PATCH", &failed);
-    } else if (client->method_override && method == UPLOAD_DELETE) {
-        headers = upload_add_header(headers, "X-HTTP-Method-Override: DELETE", &failed);
+    if (overridden) {
+        headers[n++] = "X-HTTP-Method-Override";
+        headers[n++] = names[method];
     }
     if (with_data) {
-        headers = upload_add_header(headers, "Content-Type: application/offset+octet-stream", &failed);
-        /* A creation POST lets the server refuse before the data goes out, as the spec asks; a PATCH sends it at once */
-        headers = upload_add_header(headers, method == UPLOAD_POST ? "Expect: 100-continue" : "Expect:", &failed);
-    } else if (method == UPLOAD_POST) {
-        headers = upload_add_header(headers, "Content-Type:", &failed);  /* drop the form type curl gives a POST */
+        headers[n++] = "Content-Type";
+        headers[n++] = "application/offset+octet-stream";
     }
-    if (failed) {
-        snprintf(upload->error, sizeof upload->error, "%s: out of memory", names[method]);
-        goto done;
-    }
+    headers[n] = NULL;
 
-    curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, upload_header_callback);
-    curl_easy_setopt(c, CURLOPT_HEADERDATA, (void *) response);
-    switch (method) {
-    case UPLOAD_POST:
-        if (with_data) {
-            curl_easy_setopt(c, CURLOPT_POST, 1L);
-            curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) upload->length);
-        } else {
-            curl_easy_setopt(c, CURLOPT_POSTFIELDS, "");
-        }
-        break;
-    case UPLOAD_HEAD:
-        curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
-        break;
-    case UPLOAD_PATCH:
-        curl_easy_setopt(c, CURLOPT_UPLOAD, 1L);
-        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, client->method_override ? "POST" : "PATCH");
-        if (upload->length != VECTUS_LENGTH_UNKNOWN) {  /* otherwise curl sends the stream chunked */
-            curl_easy_setopt(c, CURLOPT_INFILESIZE_LARGE, (curl_off_t) (upload->length - upload->offset));
-        }
-        break;
-    case UPLOAD_DELETE:
-        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, client->method_override ? "POST" : "DELETE");
-        break;
+    exchange.upload = upload;
+    exchange.response = response;
+    request.method = overridden ? "POST" : names[method];
+    request.url = url;
+    request.headers = headers;
+    if (method == UPLOAD_POST || method == UPLOAD_PATCH) {
+        request.read = upload_read;  /* a POST without data still goes out with an empty body */
+        request.length = !with_data ? 0
+                         : method == UPLOAD_POST || upload->length == VECTUS_LENGTH_UNKNOWN ? upload->length
+                         : upload->length - upload->offset;
+        /* A creation POST lets the server refuse before the data goes out, as the spec asks; a PATCH sends it at once */
+        request.expect_continue = method == UPLOAD_POST && with_data;
     }
-    if (with_data) {
-        curl_easy_setopt(c, CURLOPT_READFUNCTION, upload_read_callback);
-        curl_easy_setopt(c, CURLOPT_READDATA, (void *) upload);
-    }
-    if (upload->progress != NULL) {
-        curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, upload_progress_callback);
-        curl_easy_setopt(c, CURLOPT_XFERINFODATA, (void *) upload);
-    }
+    if (upload->progress != NULL) request.progress = upload_progress;
+    request.header = upload_handle_header;
+    request.userdata = &exchange;
 
     upload->source_failed = NULL;
     upload->cancelled = 0;
-    code = vectus_request(client, c, names[method], &headers, upload->error, &upload->status);
+    code = vectus_send(client, &upload->connection, names[method], &request, upload->error, &upload->status);
     response->status = upload->status;
     if (code == VECTUS_OK && response->out_of_memory) {
         snprintf(upload->error, sizeof upload->error, "%s: out of memory", names[method]);
@@ -394,9 +349,6 @@ static vectus_code upload_request(vectus_client client, vectus_upload upload, en
         snprintf(upload->error, sizeof upload->error, "%s, at byte %llu", upload->source_failed, upload->position);
         code = VECTUS_ERR_SOURCE;
     }
-
-done:
-    curl_slist_free_all(headers);
     return code;
 }
 
@@ -620,7 +572,7 @@ void vectus_upload_set_progress(vectus_upload upload, vectus_progress_callback c
 }
 
 vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const *partial_urls, size_t count) {
-    static const char prefix[] = "Upload-Concat: final;";
+    static const char prefix[] = "final;";
     size_t size = sizeof prefix;
     char *end;
     size_t i;
@@ -667,16 +619,10 @@ vectus_code vectus_upload_create_final(vectus_upload *upload, const char *const 
 static vectus_code upload_discover(vectus_client client, vectus_upload upload) {
     vectus_code code;
 
-    CURL *c;
-
     if (client->discovered) {
         return VECTUS_OK;
     }
-    c = upload_handle(upload, "OPTIONS");
-    if (c == NULL) {
-        return VECTUS_ERR_MEMORY;
-    }
-    code = vectus_discover(client, c);
+    code = vectus_discover(client, &upload->connection);
     upload->status = client->status;
     memcpy(upload->error, client->error, sizeof upload->error);
     return code;
@@ -791,7 +737,6 @@ static void upload_base64(const unsigned char *in, size_t len, char *out) {
 }
 
 vectus_code vectus_upload_add_metadata(vectus_upload upload, const char *key, const char *value) {
-    static const char prefix[] = "Upload-Metadata: ";
     size_t key_len;
     size_t value_len;
     size_t used;
@@ -807,7 +752,7 @@ vectus_code vectus_upload_add_metadata(vectus_upload upload, const char *key, co
     key_len = strlen(key);
     value_len = strlen(value);
     used = upload->metadata != NULL ? strlen(upload->metadata) : 0;
-    pair = upload->metadata != NULL ? upload->metadata + sizeof prefix - 1 : NULL;
+    pair = upload->metadata;
 
     /* The key goes into the header as it is, where spaces and commas separate the pairs */
     if (key_len == 0) {
@@ -826,15 +771,15 @@ vectus_code vectus_upload_add_metadata(vectus_upload upload, const char *key, co
         if (pair != NULL) pair++;
     }
 
-    /* The prefix before the first pair and a comma before the others, then the key, a space and the Base64 value */
-    size = (used == 0 ? sizeof prefix : used + 2) + key_len + 1 + (value_len + 2) / 3 * 4;
+    /* A comma before all but the first pair, then the key, a space and the Base64 value */
+    size = (used == 0 ? 1 : used + 2) + key_len + 1 + (value_len + 2) / 3 * 4;
     grown = realloc(upload->metadata, size);
     if (grown == NULL) {
         return VECTUS_ERR_MEMORY;
     }
     upload->metadata = grown;
     end = grown + used;
-    end += snprintf(end, size - used, "%s%s", used == 0 ? prefix : ",", key);
+    end += snprintf(end, size - used, "%s%s", used == 0 ? "" : ",", key);
     if (value_len > 0) {  /* an empty value may leave out the space too */
         *end++ = ' ';
         upload_base64((const unsigned char *) value, value_len, end);
@@ -885,6 +830,6 @@ void vectus_upload_cleanup(vectus_upload upload) {
     free(upload->metadata);
     free(upload->final);
     if (upload->file != NULL) fclose(upload->file);
-    curl_easy_cleanup(upload->curl);  /* no-op on NULL */
+    vectus_close(&upload->connection);
     free(upload);
 }

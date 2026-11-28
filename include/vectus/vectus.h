@@ -41,7 +41,8 @@ typedef size_t (*vectus_read_callback)(void *userdata, char *buffer, size_t size
 typedef int (*vectus_seek_callback)(void *userdata, unsigned long long offset);
 
 /**
- * Called as the data goes out, at least once a second while a request runs, so it can show progress or cancel.
+ * Called as the data goes out, and at least once a second while a request runs if the transport can, as curl's does,
+ * so it can show progress or cancel.
  * offset counts the bytes sent so far, starting from what the server confirmed; resuming can take it back
  *
  * @param length the upload's length, VECTUS_LENGTH_UNKNOWN until a stream of unknown length ends
@@ -65,7 +66,7 @@ typedef struct vectus_upload_s *vectus_upload;
  * @param userdata passed to both callbacks
  * @param length the number of bytes to upload, or VECTUS_LENGTH_UNKNOWN
  * @return VECTUS_OK, VECTUS_ERR_INVALID without a read_callback, VECTUS_ERR_MEMORY,
- *         or VECTUS_ERR_TOO_LARGE if length does not fit curl's signed 64-bit size
+ *         or VECTUS_ERR_TOO_LARGE if length is over 2^63 - 1 bytes, which HTTP clients count in signed 64 bits
  */
 vectus_code vectus_upload_create(vectus_upload *upload, vectus_read_callback read_callback, vectus_seek_callback seek_callback,
                                  void *userdata, unsigned long long length);
@@ -181,7 +182,7 @@ long vectus_upload_http_status(vectus_upload upload);
 
 /**
  * Why the last vectus_upload_perform or vectus_upload_terminate failed, in more detail than vectus_strerror:
- * curl's reason, the HTTP status and request, or what the server or the data got wrong
+ * the transport's reason, the HTTP status and request, or what the server or the data got wrong
  *
  * @return a message valid until the next call on the upload, "" when it succeeded
  */

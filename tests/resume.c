@@ -88,7 +88,7 @@ START_TEST(test_resume_after_stall)
 
     toxics_clear();
     c = live_client("VECTUS_TEST_PROXIED_URL");
-    c->stall_timeout = 2;
+    c->transport_userdata = &stall_2s;
     source.hook = stall_now;  /* the connection goes silent once 1 MiB has been read */
     source.hook_at = 1 * MIB;
     ck_assert_int_eq(vectus_upload_create(&u, source_read, source_seek, &source, 4 * MIB), VECTUS_OK);

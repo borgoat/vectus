@@ -17,6 +17,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <vectus/curl.h>
 #include <vectus/vectus.h>
 
 static int show_progress(void *userdata, unsigned long long offset, unsigned long long length) {
@@ -38,7 +39,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    code = vectus_client_create(&client, argv[1]);
+    code = vectus_client_create(&client, argv[1], vectus_curl_transport(), NULL);
     if (code == VECTUS_OK && authorization != NULL) code = vectus_client_set_header(client, "Authorization", authorization);
     if (code == VECTUS_OK) code = vectus_upload_create_file(&upload, argv[2]);
     if (code == VECTUS_OK) code = vectus_upload_add_metadata(upload, "filename", name);

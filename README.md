@@ -1,16 +1,18 @@
 # vectus
 
-A C99 client for [tus](https://tus.io), the open protocol for resumable uploads, built on libcurl.
+A C99 client for [tus](https://tus.io), the open protocol for resumable uploads, sending its requests through
+libcurl or any other HTTP client you plug in.
 Uploads survive dropped connections, stalled networks and restarted processes: call `vectus_upload_perform`
 again and it carries on from the last byte the server has.
 
 ```c
+#include <vectus/curl.h>
 #include <vectus/vectus.h>
 
 vectus_client client;
 vectus_upload upload;
 
-vectus_client_create(&client, "https://tus.example.com/files/");
+vectus_client_create(&client, "https://tus.example.com/files/", vectus_curl_transport(), NULL);
 vectus_client_set_header(client, "Authorization", "Bearer <token>");
 vectus_upload_create_file(&upload, "video.mp4");
 
@@ -51,7 +53,7 @@ with `vectus_upload_create`. Give it a seek callback too, so an upload can resum
 known up front, as for a pipe, pass `VECTUS_LENGTH_UNKNOWN`, and the stream's end is the upload's end.
 
 **Errors** come back as a `vectus_code`; `vectus_strerror` names it, and `vectus_upload_error` says what happened,
-such as `PATCH answered HTTP 503` or curl's reason for a failed connection. `vectus_upload_http_status` gives
+such as `PATCH answered HTTP 503` or the transport's reason for a failed connection. `vectus_upload_http_status` gives
 the status to act on. These are worth another `vectus_upload_perform`, which resumes where the server stopped:
 
 - `VECTUS_ERR_TRANSPORT`: the connection failed or stalled for 30 seconds
@@ -65,31 +67,33 @@ to `vectus_upload_set_url` on a new upload of the same data. `vectus_upload_expi
 remove an unfinished one.
 
 **Progress** reaches a callback set with `vectus_upload_set_progress`, at least once a second while a request
-runs; returning non-zero cancels the upload, which can be resumed later.
+runs if the transport can, as curl's does; returning non-zero cancels the upload, which can be resumed later.
 
 **Metadata**, such as a file name, goes along with `vectus_upload_add_metadata`.
 
 **Parallel uploads** split the data into partial uploads (`vectus_upload_set_partial`), each sent on its own
 thread, then join them with `vectus_upload_create_final`.
 
-**TLS, proxies and other curl settings** go through `vectus_client_set_curl_callback`, called with each
-request's `CURL *` handle:
+**TLS, proxies and other curl settings** go through a callback in the curl transport's options, called with each
+request's `CURL *` handle; the options must outlive the client:
 
 ```c
-#include <curl/curl.h>
-
-static void use_company_ca(void *userdata, void *curl) {
+static void use_company_ca(void *userdata, CURL *curl) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, "/etc/ssl/company-ca.pem");
 }
 
-vectus_client_set_curl_callback(client, use_company_ca, NULL);
-```
+static struct vectus_curl_options options = {use_company_ca, NULL};
 
-Code calling curl itself links it too: `CURL::libcurl` from `find_package(CURL)` in CMake; pkg-config already adds it.
+vectus_client_create(&client, "https://tus.example.com/files/", vectus_curl_transport(), &options);
+```
 
 **Threads**: call `curl_global_init(CURL_GLOBAL_DEFAULT)` once before starting them, unless your libcurl is
 7.84 or newer and built thread-safe. Threads may share a client, each with its own uploads, once
 `vectus_client_discover` asked the server what it offers; before that, their uploads would all ask at once.
+
+**Other HTTP clients** carry the requests through a `vectus_transport`: three functions to open a connection, send
+one request over it and close it, described in [`vectus/transport.h`](include/vectus/transport.h).
+vectus builds each request and reads the response; the transport only moves the bytes.
 
 The headers in [`include/vectus`](include/vectus) document every function.
 
