@@ -1,0 +1,15 @@
+menu "vectus tests"
+
+    config VECTUS_TEST_URL
+        string "tusd's upload endpoint"
+        default "http://vectus-tusd:8080/files/"
+
+    config VECTUS_TEST_PROXIED_URL
+        string "The same endpoint through Toxiproxy"
+        default "http://vectus-toxiproxy:8666/files/"
+
+    config VECTUS_TEST_TOXIPROXY
+        string "Toxiproxy's API"
+        default "http://vectus-toxiproxy:8474"
+
+endmenu

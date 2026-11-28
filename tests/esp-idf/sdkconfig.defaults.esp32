@@ -1,0 +1,5 @@
+# ESP32-LyraTD-MSC V2.2: an ESP32-WROVER-E module, with 4 MB of flash and 8 MB of PSRAM
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_SPIRAM=y
+# Wi-Fi, TLS and the HTTP client alone fill 98% of the default 1 MB app partition
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

@@ -93,6 +93,11 @@ vectus_client_create(&client, "https://tus.example.com/files/", vectus_curl_tran
 7.84 or newer and built thread-safe. Threads may share a client, each with its own uploads, once
 `vectus_client_discover` asked the server what it offers; before that, their uploads would all ask at once.
 
+**On ESP-IDF**, the repository is a component holding the core and a transport over `esp_http_client`: put it in a
+project's `components/vectus` directory, such as with `git submodule add`, and create clients with
+`vectus_esp_transport()` from [`vectus/esp.h`](include/vectus/esp.h). A callback in its options sets what else each
+`esp_http_client_config_t` needs, such as `cert_pem` for a private certificate authority. It is tested on ESP-IDF 5.5.
+
 **Other HTTP clients** carry the requests through a `vectus_transport`: three functions to open a connection, send
 one request over it and close it, described in [`vectus/transport.h`](include/vectus/transport.h).
 vectus builds each request and reads the response; the transport only moves the bytes.
@@ -115,6 +120,9 @@ purpose, and prints the variables that also run the tests against them:
 export $(tests/e2e-env.sh)
 ctest --test-dir build --output-on-failure
 ```
+
+`tests/esp-idf/run.sh` runs the ESP-IDF transport's tests against them too, on ESP-IDF's linux target in Docker, then builds
+them for the ESP32.
 
 ## License
 
